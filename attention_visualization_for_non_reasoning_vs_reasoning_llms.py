@@ -7,7 +7,19 @@ Original file is located at
     https://colab.research.google.com/drive/1eezvrVvmYXf_veCtAFr6CNu1y9M-w_VG
 """
 
-!pip -q install -U transformers accelerate sentencepiece
+# Install deps into the running kernel's environment.
+#
+# Written as plain Python rather than the `!pip` shell escape: `%run` only
+# transforms `%magic` lines, not `!` escapes, so a `!pip` line here raises
+# SyntaxError. This form works both under `%run` in Colab and as a plain
+# `python file.py`.
+import sys
+import subprocess
+
+subprocess.check_call(
+    [sys.executable, "-m", "pip", "install", "-q", "-U",
+     "transformers", "accelerate", "sentencepiece"]
+)
 
 import torch
 

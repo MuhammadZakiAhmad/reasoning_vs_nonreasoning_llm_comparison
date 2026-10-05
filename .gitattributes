@@ -1,0 +1,3 @@
+# Colab checks out on Linux; force LF so nothing ever lands there as CRLF.
+* text=auto eol=lf
+*.png binary

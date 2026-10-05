@@ -1,0 +1,11 @@
+# Claude Code local state
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+*.egg-info/
+
+# Generated output
+*.png

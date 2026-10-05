@@ -35,6 +35,10 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
+# display() renders objects into the Colab output. Imported explicitly rather
+# than relying on it being pre-injected into the kernel namespace.
+from IPython.display import display
+
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -42,11 +46,20 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 IFT_MODEL = "Scale-or-Reason/Qwen2.5-1.5B-ift"
 REASONING_MODEL = "Scale-or-Reason/Qwen2.5-1.5B-reasoning"
 
-# Start small. We can increase this later.
-MAX_NEW_TOKENS = 256
+# Cap on generated tokens. Both models answer these prompts in long form
+# (the IFT model writes a full worked solution), so 256 was truncating them
+# mid-sentence. 1024 is enough for a complete answer on these prompts.
+#
+# Cost warning: collect_prompt_attention() runs one forward pass per generated
+# token, so this is linear in generated length. Raising this raises runtime
+# proportionally -- 1024 is roughly 4x the work of 256, per model.
+MAX_NEW_TOKENS = 1024
 
-# Sampling allows each model to generate naturally rather than
-# forcing a fixed deterministic response.
+# Which entry of PROMPT_SPECS to analyse.
+TEST_PROMPT_INDEX = 2
+
+# Declared but NOT currently used: generate_response() hardcodes
+# do_sample=False, so decoding is always greedy. See project history.
 DO_SAMPLE = True
 TEMPERATURE = 0.7
 TOP_P = 0.9
@@ -93,6 +106,63 @@ prompts = [
 
 len(prompts)
 
+# ============================================================
+# GROUND TRUTH AND ANSWER-CHECKING
+# ============================================================
+#
+# `must_contain` entries are expected to appear in a correct response.
+# The check is deliberately crude: it looks for marker strings, so it will
+# catch an obviously wrong answer but NOT a right-answer-wrong-reasoning, a
+# subtly wrong number, or a marker that appears incidentally.
+#
+# Treat the verdict as a flag to go read the response, never as proof.
+
+PROMPT_SPECS = [
+    {
+        "prompt": "What is the capital of France?",
+        "ground_truth": "Paris",
+        "must_contain": ["paris"],
+    },
+    {
+        "prompt": "If a train travels 60 kilometers in 1 hour, how far will it travel in 3 hours?",
+        "ground_truth": "180 kilometers",
+        "must_contain": ["180"],
+    },
+    {
+        "prompt": "A farmer has chickens and cows. There are 10 animals in total and 28 legs. How many chickens and how many cows are there?",
+        "ground_truth": "6 chickens and 4 cows",
+        "must_contain": ["6", "4"],
+    },
+    {
+        "prompt": "Why does ice float on water?",
+        "ground_truth": "Ice is less dense than liquid water",
+        "must_contain": ["dens"],
+    },
+    {
+        "prompt": "John is older than Mary. Mary is older than Sarah. Who is the youngest?",
+        "ground_truth": "Sarah",
+        "must_contain": ["sarah"],
+    },
+]
+
+
+def check_answer(response_text, spec):
+    """Crude marker-match verdict. Returns (verdict, hits, misses)."""
+
+    text = response_text.lower()
+
+    hits = [m for m in spec["must_contain"] if m in text]
+    misses = [m for m in spec["must_contain"] if m not in text]
+
+    if not misses:
+        verdict = "CORRECT"
+    elif hits:
+        verdict = "PARTIAL"
+    else:
+        verdict = "INCORRECT"
+
+    return verdict, hits, misses
+
 @torch.no_grad()
 def generate_response(model, tokenizer, prompt):
 
@@ -124,6 +194,13 @@ def generate_response(model, tokenizer, prompt):
         generated_ids,
         skip_special_tokens=True
     )
+
+    if generated_ids.shape[0] >= MAX_NEW_TOKENS:
+        print(
+            f"WARNING: generation stopped at the {MAX_NEW_TOKENS}-token cap, "
+            "so this response is TRUNCATED and the answer may be incomplete. "
+            "Raise MAX_NEW_TOKENS and re-run."
+        )
 
     return (
         inputs["input_ids"][0].detach().cpu(),
@@ -256,7 +333,8 @@ def average_prompt_attention(attention_tensor):
 
     return attention_tensor.mean(dim=(0, 1, 2))
 
-test_prompt = prompts[2]
+test_prompt = prompts[TEST_PROMPT_INDEX]
+test_spec = PROMPT_SPECS[TEST_PROMPT_INDEX]
 
 print("PROMPT:")
 print(test_prompt)
@@ -342,6 +420,34 @@ print(reasoning_text)
 print("\nGenerated tokens:")
 print(len(reasoning_generated_ids))
 
+# ============================================================
+# ANSWER CHECK
+# ============================================================
+
+print("\n" + "=" * 64)
+print("ANSWER CHECK (heuristic marker match -- read the response yourself)")
+print("=" * 64)
+
+print("Ground truth:", test_spec["ground_truth"])
+
+ift_verdict, ift_hits, ift_misses = check_answer(ift_text, test_spec)
+reasoning_verdict, reasoning_hits, reasoning_misses = check_answer(
+    reasoning_text, test_spec
+)
+
+print(f"IFT       : {ift_verdict}   hits={ift_hits}  misses={ift_misses}")
+print(f"Reasoning : {reasoning_verdict}   hits={reasoning_hits}  misses={reasoning_misses}")
+
+# Generated length matters for the comparison below: average_prompt_attention()
+# averages over however many tokens each model produced, so unequal counts mean
+# the two averages cover different amounts of each response.
+print(
+    f"Tokens generated -- IFT: {len(ift_generated_ids)}"
+    f"  Reasoning: {len(reasoning_generated_ids)}"
+)
+
+print("=" * 64)
+
 print("\nCollecting reasoning attention...")
 
 reasoning_attention = collect_prompt_attention(
@@ -354,6 +460,18 @@ reasoning_attention = collect_prompt_attention(
 reasoning_avg_attention = average_prompt_attention(
     reasoning_attention
 )
+
+# How much of each model's attention lands on the prompt at all, rather than on
+# its own generated tokens. This is the quantity the per-prompt renormalization
+# further down divides out, so it is NOT visible in the final comparison table.
+#
+# It is often the bigger effect: a model that mostly attends to its own
+# reasoning trace scores much lower here than one that keeps looking back at
+# the question.
+print("\nPrompt attention mass (share of attention on prompt tokens):")
+print(f"  IFT       : {ift_avg_attention.sum().item():.4f}")
+print(f"  Reasoning : {reasoning_avg_attention.sum().item():.4f}")
+print("  Scale: 1.0 means all attention stayed on prompt tokens.")
 
 print("\nAttention tensor shape:")
 print(reasoning_attention.shape)
@@ -394,37 +512,43 @@ display(comparison)
 x = np.arange(len(comparison))
 width = 0.38
 
-plt.figure(figsize=(14, 6))
+fig, ax = plt.subplots(figsize=(14, 6))
 
-plt.bar(
+ax.bar(
     x - width / 2,
     comparison["IFT_attention"],
     width,
     label="IFT"
 )
 
-plt.bar(
+ax.bar(
     x + width / 2,
     comparison["Reasoning_attention"],
     width,
     label="Reasoning"
 )
 
-plt.xticks(
-    x,
-    comparison["token"],
-    rotation=60,
-    ha="right"
+ax.set_xticks(x)
+ax.set_xticklabels(comparison["token"], rotation=60, ha="right")
+
+ax.set_ylabel("Average attention from generated tokens")
+ax.set_xlabel("Original prompt token")
+
+ax.set_title(
+    "Prompt-token attention: IFT vs Reasoning\n"
+    f"IFT: {ift_verdict}   |   Reasoning: {reasoning_verdict}"
+    f"   (ground truth: {test_spec['ground_truth']})"
 )
 
-plt.ylabel("Average attention from generated tokens")
-plt.xlabel("Original prompt token")
-plt.title("Prompt-token attention: IFT vs Reasoning")
+ax.legend()
 
-plt.legend()
-plt.tight_layout()
-plt.savefig("ift_vs_reasoning_attention.png", dpi=150)
-plt.show()
+fig.tight_layout()
+fig.savefig("ift_vs_reasoning_attention.png", dpi=150, bbox_inches="tight")
+
+# display(fig) rather than plt.show(): under `%run` there is no cell output
+# area for the inline backend to draw into, which is why the previous run
+# emitted a bare empty figure instead of the chart.
+display(fig)
 
 # ============================================================
 # TOKEN-BY-TOKEN ATTENTION COMPARISON

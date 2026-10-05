@@ -193,45 +193,61 @@ def check_answer(response_text, spec, scope="full"):
     }
 
 
-def find_degenerate_tail(generated_ids, max_ngram=8, min_run_tokens=40):
-    """Index where a repeated-n-gram collapse begins, or None if there is none.
+def find_degenerate_tail(generated_ids, max_period=256, min_run_tokens=40):
+    """Find a periodic tail -- the model looping after it finished answering.
 
-    A small model under greedy decoding sometimes finishes its answer and then
-    loops on a short n-gram forever ('ifrifrifr...'). Those tokens carry no
-    answer content, so averaging attention over them measures the loop, not the
-    solution.
+    Returns (start_index, period), or (None, None) when the generation ends
+    normally.
 
-    For n in 1..max_ngram, find the longest run of consecutive identical
-    n-grams. A run covering >= min_run_tokens tokens counts as a collapse.
-    Returns the earliest such start so nothing before the loop is discarded.
+    Detection: for each candidate period p, find the last position where the
+    sequence breaks its own p-periodicity (ids[i] != ids[i - p]). Everything
+    after that break is an unbroken stretch of p-token repeats. A stretch of at
+    least min_run_tokens that also spans at least two full periods is a
+    collapse; the smallest such start wins, because if the tail is p-periodic
+    from index k then it IS a loop from k for any p that holds.
+
+    Note the off-by-one-period: periodicity is only *detectable* from the second
+    copy onward, since the first copy has nothing before it to match against.
+    The confirmed start is therefore walked back one period, to the beginning of
+    that first copy -- which is where the repetition actually starts.
+
+    Why periodicity rather than the obvious "longest repeated n-gram": the
+    observed loops are whole *sentences*. The IFT model repeated a ~30-token
+    sentence to the 1024 cap, and a fixed small n-gram window misses that
+    entirely -- as the France run demonstrated, reporting "no collapse" while
+    ~75% of the generation was a chat loop. Sweeping the period catches loops
+    of any length up to max_period, and returning the period says which kind of
+    loop it was.
+
+    Known limit: only the TAIL is examined, which matches "model finished, then
+    never stopped". A loop that starts mid-generation and then recovers is not
+    detected.
     """
 
     ids = generated_ids.tolist()
     total = len(ids)
 
-    best = None
+    best_start = None
+    best_period = None
 
-    for n in range(1, max_ngram + 1):
+    for period in range(1, min(max_period, total - 1) + 1):
 
-        i = 0
+        last_break = -1
 
-        while i + n <= total and (best is None or i < best):
+        for i in range(period, total):
+            if ids[i] != ids[i - period]:
+                last_break = i
 
-            gram = ids[i:i + n]
+        # Back up one period, to the start of the first unbroken copy.
+        start = max(0, last_break + 1 - period)
+        run = total - start
 
-            reps = 1
-            j = i + n
+        if run >= min_run_tokens and run >= 2 * period:
+            if best_start is None or start < best_start:
+                best_start = start
+                best_period = period
 
-            while j + n <= total and ids[j:j + n] == gram:
-                reps += 1
-                j += n
-
-            if reps * n >= min_run_tokens and (best is None or i < best):
-                best = i
-
-            i += 1
-
-    return best
+    return best_start, best_period
 
 @torch.no_grad()
 def generate_response(model, tokenizer, prompt):
@@ -422,10 +438,15 @@ print("\nIFT RESPONSE:")
 print(ift_text)
 
 # Drop any repetition collapse before averaging. Averaging over a loop measures
-# the loop, not the solution -- on the chickens/cows run the IFT model finished
-# its answer and then emitted 'ifr' to the cap, so a majority of its "generated
-# tokens" were noise.
-ift_degenerate_start = find_degenerate_tail(ift_generated_ids)
+# the loop, not the solution -- the IFT model answers "capital of France" in one
+# line and then chats to the cap, so without this its average is mostly a
+# conversation loop.
+#
+# The old n-gram version of this check MISSED that loop: the repeated unit is a
+# ~30-token sentence, well beyond any small fixed n-gram window. It now sweeps
+# the period instead, so the loop is caught and the reported period says what
+# kind of loop it was.
+ift_degenerate_start, ift_degenerate_period = find_degenerate_tail(ift_generated_ids)
 
 if ift_degenerate_start is None:
     ift_attention_ids = ift_generated_ids
@@ -434,8 +455,9 @@ else:
     ift_attention_ids = ift_generated_ids[:ift_degenerate_start]
     print(
         f"\nREPETITION COLLAPSE at generated token {ift_degenerate_start} of "
-        f"{len(ift_generated_ids)}. Attention uses only the first "
-        f"{len(ift_attention_ids)} tokens -- the loop is excluded."
+        f"{len(ift_generated_ids)} (period {ift_degenerate_period} tokens). "
+        f"Attention uses only the first {len(ift_attention_ids)} tokens -- the "
+        "loop is excluded."
     )
 
 if len(ift_attention_ids) == 0:
@@ -565,7 +587,9 @@ print(
 
 print("=" * 64)
 
-reasoning_degenerate_start = find_degenerate_tail(reasoning_generated_ids)
+reasoning_degenerate_start, reasoning_degenerate_period = find_degenerate_tail(
+    reasoning_generated_ids
+)
 
 if reasoning_degenerate_start is None:
     reasoning_attention_ids = reasoning_generated_ids
@@ -574,8 +598,9 @@ else:
     reasoning_attention_ids = reasoning_generated_ids[:reasoning_degenerate_start]
     print(
         f"\nREPETITION COLLAPSE at generated token {reasoning_degenerate_start} of "
-        f"{len(reasoning_generated_ids)}. Attention uses only the first "
-        f"{len(reasoning_attention_ids)} tokens -- the loop is excluded."
+        f"{len(reasoning_generated_ids)} (period {reasoning_degenerate_period} tokens). "
+        f"Attention uses only the first {len(reasoning_attention_ids)} tokens -- the "
+        "loop is excluded."
     )
 
 if len(reasoning_attention_ids) == 0:

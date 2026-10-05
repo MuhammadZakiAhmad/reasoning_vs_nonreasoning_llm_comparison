@@ -45,10 +45,14 @@ from models import get_model
 # work of 256, per model.
 MAX_NEW_TOKENS = 1024
 
-# Which entry of PROMPT_SPECS to analyse. Set to 0 for a trivial question
-# ("capital of France") to test whether the IFT model really answers directly
-# or also writes out a worked solution.
-TEST_PROMPT_INDEX = 2
+# Which entry of PROMPT_SPECS to analyse.
+#
+# Now 0 ("capital of France"). The chickens/cows prompt (index 2) got a full
+# worked solution out of BOTH models, so it could not settle whether the IFT
+# checkpoint is really non-reasoning. A trivial factual question is the test:
+# if IFT writes a worked solution here too, the reasoning-vs-non-reasoning
+# framing is dead and the project needs reframing.
+TEST_PROMPT_INDEX = 0
 
 # Declared but NOT currently used: generate_response() hardcodes
 # do_sample=False, so decoding is always greedy. See project history.
@@ -115,13 +119,63 @@ PROMPT_SPECS = [
 ]
 
 
-def check_answer(response_text, spec):
-    """Crude marker-match verdict. Returns (verdict, hits, misses)."""
+# Closing tag that ends the reasoning model's trace. Guessed from the '<think>'
+# opening tag seen in output -- VERIFY against a non-truncated reasoning
+# response. If the real closing tag differs, final_answer_region() returns None
+# and every reasoning verdict reads NO FINAL ANSWER (which is at least honest,
+# but wrong about why).
+REASONING_END_TAGS = ("</think>", "</thinking>")
 
-    text = response_text.lower()
+
+def final_answer_region(response_text):
+    """Text after the reasoning trace closes, or None if it never closed.
+
+    None means the model was still reasoning when generation stopped. There is
+    then no answer to grade, and any marker found in the raw text sits inside
+    the working-out, not in an answer.
+    """
+
+    for tag in REASONING_END_TAGS:
+        idx = response_text.find(tag)
+
+        if idx != -1:
+            return response_text[idx + len(tag):]
+
+    return None
+
+
+def check_answer(response_text, spec, scope="full"):
+    """Marker-match verdict over `scope`, reporting WHERE each marker matched.
+
+    scope='full'  -- whole response; right for a model that answers directly
+    scope='final' -- only after the reasoning trace closes
+
+    Deliberately crude: it catches an obviously wrong answer, NOT a
+    right-answer-wrong-reasoning or a marker that appears incidentally. The
+    positions are the point of returning a dict -- an answer found only inside
+    a working-out is not an answer, and only the positions reveal that.
+    """
+
+    if scope == "final":
+        region = final_answer_region(response_text)
+    else:
+        region = response_text
+
+    if region is None:
+        return {
+            "verdict": "NO FINAL ANSWER",
+            "hits": [],
+            "misses": list(spec["must_contain"]),
+            "positions": {},
+            "scope_chars": 0,
+        }
+
+    text = region.lower()
 
     hits = [m for m in spec["must_contain"] if m in text]
     misses = [m for m in spec["must_contain"] if m not in text]
+
+    positions = {m: text.find(m) for m in hits}
 
     if not misses:
         verdict = "CORRECT"
@@ -130,7 +184,54 @@ def check_answer(response_text, spec):
     else:
         verdict = "INCORRECT"
 
-    return verdict, hits, misses
+    return {
+        "verdict": verdict,
+        "hits": hits,
+        "misses": misses,
+        "positions": positions,
+        "scope_chars": len(region),
+    }
+
+
+def find_degenerate_tail(generated_ids, max_ngram=8, min_run_tokens=40):
+    """Index where a repeated-n-gram collapse begins, or None if there is none.
+
+    A small model under greedy decoding sometimes finishes its answer and then
+    loops on a short n-gram forever ('ifrifrifr...'). Those tokens carry no
+    answer content, so averaging attention over them measures the loop, not the
+    solution.
+
+    For n in 1..max_ngram, find the longest run of consecutive identical
+    n-grams. A run covering >= min_run_tokens tokens counts as a collapse.
+    Returns the earliest such start so nothing before the loop is discarded.
+    """
+
+    ids = generated_ids.tolist()
+    total = len(ids)
+
+    best = None
+
+    for n in range(1, max_ngram + 1):
+
+        i = 0
+
+        while i + n <= total and (best is None or i < best):
+
+            gram = ids[i:i + n]
+
+            reps = 1
+            j = i + n
+
+            while j + n <= total and ids[j:j + n] == gram:
+                reps += 1
+                j += n
+
+            if reps * n >= min_run_tokens and (best is None or i < best):
+                best = i
+
+            i += 1
+
+    return best
 
 @torch.no_grad()
 def generate_response(model, tokenizer, prompt):
@@ -166,9 +267,10 @@ def generate_response(model, tokenizer, prompt):
 
     if generated_ids.shape[0] >= MAX_NEW_TOKENS:
         print(
-            f"WARNING: generation stopped at the {MAX_NEW_TOKENS}-token cap, "
-            "so this response is TRUNCATED and the answer may be incomplete. "
-            "Raise MAX_NEW_TOKENS and re-run."
+            f"NOTE: generation reached the {MAX_NEW_TOKENS}-token cap. That means "
+            "EITHER the answer is truncated OR the model finished and then fell "
+            "into a repetition loop. find_degenerate_tail() below separates the "
+            "two; read the response to confirm which."
         )
 
     return (
@@ -319,13 +421,33 @@ ift_prompt_ids, ift_generated_ids, ift_text = generate_response(
 print("\nIFT RESPONSE:")
 print(ift_text)
 
+# Drop any repetition collapse before averaging. Averaging over a loop measures
+# the loop, not the solution -- on the chickens/cows run the IFT model finished
+# its answer and then emitted 'ifr' to the cap, so a majority of its "generated
+# tokens" were noise.
+ift_degenerate_start = find_degenerate_tail(ift_generated_ids)
+
+if ift_degenerate_start is None:
+    ift_attention_ids = ift_generated_ids
+    print(f"\nNo repetition collapse. Using all {len(ift_generated_ids)} generated tokens.")
+else:
+    ift_attention_ids = ift_generated_ids[:ift_degenerate_start]
+    print(
+        f"\nREPETITION COLLAPSE at generated token {ift_degenerate_start} of "
+        f"{len(ift_generated_ids)}. Attention uses only the first "
+        f"{len(ift_attention_ids)} tokens -- the loop is excluded."
+    )
+
+if len(ift_attention_ids) == 0:
+    raise RuntimeError("IFT generation collapsed immediately; nothing to average.")
+
 print("\nCollecting IFT attention...")
 
 ift_attention = collect_prompt_attention(
     ift_model,
     ift_tokenizer,
     test_prompt,
-    ift_generated_ids
+    ift_attention_ids
 )
 
 print("\nAttention tensor shape:")
@@ -399,13 +521,39 @@ print("=" * 64)
 
 print("Ground truth:", test_spec["ground_truth"])
 
-ift_verdict, ift_hits, ift_misses = check_answer(ift_text, test_spec)
-reasoning_verdict, reasoning_hits, reasoning_misses = check_answer(
-    reasoning_text, test_spec
-)
+# IFT answers directly, so grade its whole response.
+ift_check = check_answer(ift_text, test_spec, scope="full")
 
-print(f"IFT       : {ift_verdict}   hits={ift_hits}  misses={ift_misses}")
-print(f"Reasoning : {reasoning_verdict}   hits={reasoning_hits}  misses={reasoning_misses}")
+# The reasoning model must be graded ONLY after its trace closes: a marker found
+# inside <think> is working-out, not an answer. On the chickens/cows run the
+# reasoning model never emitted a closing tag, and the old whole-text check
+# called it CORRECT off '6' and '4' that only ever appeared mid-thought.
+reasoning_check = check_answer(reasoning_text, test_spec, scope="final")
+
+
+def report_check(label, result):
+
+    print(
+        f"{label}: {result['verdict']}"
+        f"   hits={result['hits']}  misses={result['misses']}"
+        f"   graded_chars={result['scope_chars']}"
+    )
+
+    for marker, pos in result["positions"].items():
+        print(f"           {marker!r} -> first at char {pos}")
+
+    if result["verdict"] == "NO FINAL ANSWER":
+        print(
+            "           no closing reasoning tag found, so the response ends "
+            "inside the trace and emitted no answer to grade"
+        )
+
+
+report_check("IFT      ", ift_check)
+report_check("Reasoning", reasoning_check)
+
+ift_verdict = ift_check["verdict"]
+reasoning_verdict = reasoning_check["verdict"]
 
 # Generated length matters for the comparison below: average_prompt_attention()
 # averages over however many tokens each model produced, so unequal counts mean
@@ -417,18 +565,38 @@ print(
 
 print("=" * 64)
 
+reasoning_degenerate_start = find_degenerate_tail(reasoning_generated_ids)
+
+if reasoning_degenerate_start is None:
+    reasoning_attention_ids = reasoning_generated_ids
+    print(f"\nNo repetition collapse. Using all {len(reasoning_generated_ids)} generated tokens.")
+else:
+    reasoning_attention_ids = reasoning_generated_ids[:reasoning_degenerate_start]
+    print(
+        f"\nREPETITION COLLAPSE at generated token {reasoning_degenerate_start} of "
+        f"{len(reasoning_generated_ids)}. Attention uses only the first "
+        f"{len(reasoning_attention_ids)} tokens -- the loop is excluded."
+    )
+
+if len(reasoning_attention_ids) == 0:
+    raise RuntimeError("Reasoning generation collapsed immediately; nothing to average.")
+
 print("\nCollecting reasoning attention...")
 
 reasoning_attention = collect_prompt_attention(
     reasoning_model,
     reasoning_tokenizer,
     test_prompt,
-    reasoning_generated_ids
+    reasoning_attention_ids
 )
 
 reasoning_avg_attention = average_prompt_attention(
     reasoning_attention
 )
+
+print("\nTokens used for attention (after collapse trim):")
+print(f"  IFT       : {len(ift_attention_ids)} / {len(ift_generated_ids)}")
+print(f"  Reasoning : {len(reasoning_attention_ids)} / {len(reasoning_generated_ids)}")
 
 # How much of each model's attention lands on the prompt at all, rather than on
 # its own generated tokens. This is the quantity the per-prompt renormalization

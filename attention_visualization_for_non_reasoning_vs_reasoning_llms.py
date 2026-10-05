@@ -61,7 +61,7 @@ def load_model(model_name):
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float32,
+        dtype=torch.float32,
         device_map="auto",
         attn_implementation="eager"
     )
@@ -316,32 +316,14 @@ def display_attention(tokenizer, prompt_ids, average_attention):
 
 # ift_df
 
-REASONING_MODEL = "Scale-or-Reason/Qwen2.5-1.5B-reasoning"
-
-print("Loading reasoning model in float32...")
-
-reasoning_tokenizer, reasoning_model = load_model(REASONING_MODEL)
-
-print("Reasoning model loaded!")
+# The reasoning model is ALREADY resident -- it was loaded alongside the IFT
+# model near the top of this file. Do not load it again: a second copy costs
+# another ~6 GB in float32 on top of the resident IFT model, which exceeds the
+# T4's ~14.5 GB and makes accelerate silently offload weights to CPU/meta.
+# That offload is what hung the previous run.
+print("Reasoning model already loaded.")
 print("Dtype:", next(reasoning_model.parameters()).dtype)
 print("Device:", next(reasoning_model.parameters()).device)
-
-print("PROMPT:")
-print(test_prompt)
-
-print("\nGenerating with reasoning model...")
-
-reasoning_prompt_ids, reasoning_generated_ids, reasoning_text = generate_response(
-    reasoning_model,
-    reasoning_tokenizer,
-    test_prompt
-)
-
-print("\nREASONING RESPONSE:")
-print(reasoning_text)
-
-print("\nGenerated tokens:")
-print(len(reasoning_generated_ids))
 
 print("PROMPT:")
 print(test_prompt)

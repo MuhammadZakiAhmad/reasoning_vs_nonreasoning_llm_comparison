@@ -449,6 +449,55 @@ def resolve_attention_trim(
     return n_used
 
 
+def verify_drift_cut(tokenizer, generated_ids, boundary_ids, window=4):
+    """Print the tokens either side of the drift cut, or say there was none.
+
+    A drift cut is only trustworthy if the token it stopped on really is a chat
+    turn marker and not an ordinary token that happens to share its id. The id
+    alone cannot settle that; the decoded text can. This window is what makes
+    the cut auditable instead of merely plausible.
+
+    Deliberately separate from resolve_attention_trim(): this needs a tokenizer,
+    and keeping the tokenizer out of the trim function is what lets the trim be
+    unit-tested against plain integer lists.
+
+    Also prints the tokenizer's eos/pad ids, because a turn marker appearing at
+    token 9 of a 1024-token generation means generation did NOT stop on it --
+    which only makes sense if eos is some other token.
+    """
+
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    eos_str = getattr(tokenizer, "eos_token", None)
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    pad_str = getattr(tokenizer, "pad_token", None)
+
+    print(f"  tokenizer eos={eos_id} ({eos_str!r})   pad={pad_id} ({pad_str!r})")
+
+    index = find_drift_start(generated_ids, boundary_ids)
+
+    if index is None:
+        print("  no drift cut for this model, so there is nothing to verify")
+        return
+
+    ids = (
+        generated_ids.tolist()
+        if hasattr(generated_ids, "tolist")
+        else list(generated_ids)
+    )
+
+    lo = max(0, index - window)
+    hi = min(len(ids), index + window + 1)
+
+    print(f"  cut at generated token {index}; boundary ids {sorted(boundary_ids)}")
+    print(f"  decoded tokens {lo}..{hi - 1}:")
+
+    for i in range(lo, hi):
+
+        flag = "   <-- CUT: this token ends the kept window" if i == index else ""
+
+        print(f"    [{i:4d}] id={ids[i]:6d}  {tokenizer.decode([ids[i]])!r}{flag}")
+
+
 @torch.no_grad()
 def generate_response(model, tokenizer, prompt):
 
@@ -920,6 +969,12 @@ ift_attention_count = resolve_attention_trim(
     ift_degenerate_period,
 )
 
+# Show what the cut actually landed on. A short window is the whole point here:
+# IFT's answer is ~9 tokens, so an off-by-one or a false-positive boundary id
+# would leave almost nothing to average and every number downstream would be
+# measuring the wrong tokens.
+verify_drift_cut(ift_tokenizer, ift_generated_ids, ift_boundary_ids)
+
 ift_attention_ids = ift_generated_ids[:ift_attention_count]
 
 if len(ift_attention_ids) == 0:
@@ -1065,6 +1120,12 @@ reasoning_attention_count = resolve_attention_trim(
     reasoning_boundary_ids,
     reasoning_degenerate_start,
     reasoning_degenerate_period,
+)
+
+verify_drift_cut(
+    reasoning_tokenizer,
+    reasoning_generated_ids,
+    reasoning_boundary_ids,
 )
 
 reasoning_attention_ids = reasoning_generated_ids[:reasoning_attention_count]

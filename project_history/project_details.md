@@ -144,3 +144,4 @@ OPEN QUESTION [S1-2026-10-05-1410]: **averaging over all generated tokens confla
 | ID | Date | Status | Working On |
 |----|------|--------|------------|
 | S1-2026-10-05-1410 | 2026-10-05 | PAUSED | Trimmed France re-run analysis; sink finding; no code pending user go-ahead |
+| S2-2026-10-06-1354 | 2026-10-06 | ACTIVE | Awaiting go-ahead; pick first blocker — sink reporting vs IFT drift-boundary trim |

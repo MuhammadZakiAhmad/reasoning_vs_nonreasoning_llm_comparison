@@ -68,12 +68,20 @@ else:
 
 # Which entry of PROMPT_SPECS to analyse.
 #
-# Now 0 ("capital of France"). The chickens/cows prompt (index 2) got a full
-# worked solution out of BOTH models, so it could not settle whether the IFT
-# checkpoint is really non-reasoning. A trivial factual question is the test:
-# if IFT writes a worked solution here too, the reasoning-vs-non-reasoning
-# framing is dead and the project needs reframing.
-TEST_PROMPT_INDEX = 0
+# Now 5 ("Which country has Paris as its capital?"). The France prompt (index 0)
+# settled the framing -- IFT answers directly, the reasoning model deliberates --
+# but its token table cannot be interpreted: the meaningful words ('France', '?')
+# are also the LAST words, so "reasoning weights meaningful words" and "reasoning
+# weights recent words" predict the same pattern.
+#
+# Index 5 is the same question asked the other way round. 'Paris' is the answer
+# and sits in the MIDDLE, while the last tokens ('capital', '?') are no longer
+# the answer. The two hypotheses now predict OPPOSITE things for 'Paris': high if
+# meaning drives attention, low if only position does. That one token decides it.
+#
+# Index 0 keeps its recorded expected values, so flipping back reproduces run #2
+# exactly -- and the run cache serves it without regenerating.
+TEST_PROMPT_INDEX = 5
 
 # Declared but NOT currently used: generate_response() hardcodes
 # do_sample=False, so decoding is always greedy. See project history.
@@ -86,20 +94,11 @@ TOP_P = 0.9
 ift_tokenizer, ift_model = get_model("ift")
 reasoning_tokenizer, reasoning_model = get_model("reasoning")
 
-prompts = [
-    "What is the capital of France?",
-
-    "If a train travels 60 kilometers in 1 hour, how far will it travel in 3 hours?",
-
-    "A farmer has chickens and cows. There are 10 animals in total and 28 legs. How many chickens and how many cows are there?",
-
-    "Why does ice float on water?",
-
-    "John is older than Mary. Mary is older than Sarah. Who is the youngest?"
-]
-
-len(prompts)
-
+# The prompt list is DERIVED from PROMPT_SPECS rather than written out again.
+# These used to be two parallel lists that had to be edited in lockstep with
+# nothing enforcing it -- so adding a prompt to one and not the other would have
+# silently shifted TEST_PROMPT_INDEX onto the wrong question.
+#
 # ============================================================
 # GROUND TRUTH AND ANSWER-CHECKING
 # ============================================================
@@ -110,12 +109,34 @@ len(prompts)
 # subtly wrong number, or a marker that appears incidentally.
 #
 # Treat the verdict as a flag to go read the response, never as proof.
+#
+# `roles` labels what each user-prompt token DOES (question word, filler, answer,
+# answer attribute, punctuation) so two prompts can be compared by role instead
+# of by position -- which is the whole point of the position-swap probe. It is
+# only applied when its length matches the real tokenization, so a wrong guess
+# degrades to a printed note rather than a broken table.
+#
+# `expected`, when present, holds a previous run's numbers so a later run can
+# prove the pipeline and cache reproduce them exactly.
 
 PROMPT_SPECS = [
     {
         "prompt": "What is the capital of France?",
         "ground_truth": "Paris",
         "must_contain": ["paris"],
+        "roles": [
+            "question", "filler", "filler", "answer-attr", "filler", "ANSWER", "punct",
+        ],
+        # Recorded from the S1 France run. Reproducing these exactly is what
+        # makes the disk cache trustworthy rather than merely convenient.
+        "expected": {
+            "ift_trim": (441, 1024, 39),
+            "reasoning_trim": (829, 1024, 1),
+            "ift_token0": 0.3950,
+            "reasoning_token0": 0.359161,
+            "ift_mass": 0.4326,
+            "reasoning_mass": 0.3891,
+        },
     },
     {
         "prompt": "If a train travels 60 kilometers in 1 hour, how far will it travel in 3 hours?",
@@ -137,7 +158,22 @@ PROMPT_SPECS = [
         "ground_truth": "Sarah",
         "must_contain": ["sarah"],
     },
+    {
+        # The position-swap probe. Same question as index 0, reversed, so the
+        # answer word sits in the middle instead of at the end. If attention
+        # tracks meaning, 'Paris' is high; if it tracks recency, 'Paris' is low
+        # and the tail wins again. No `expected` block: this run establishes one.
+        "prompt": "Which country has Paris as its capital?",
+        "ground_truth": "France",
+        "must_contain": ["france"],
+        "roles": [
+            "question", "question", "filler", "ANSWER",
+            "filler", "filler", "answer-attr", "punct",
+        ],
+    },
 ]
+
+prompts = [spec["prompt"] for spec in PROMPT_SPECS]
 
 
 # Closing tag that ends the reasoning model's trace. Guessed from the '<think>'
@@ -623,6 +659,81 @@ def keep_reader_heads(attention, share, threshold, sink_index=SINK_INDEX):
 
     return prompt_vector, retained, int(keep.sum()), int(keep.size)
 
+
+# ============================================================
+# STAGE B HELPERS: SEPARATING MEANING FROM POSITION
+# ============================================================
+
+
+def rank_positions_vs_attention(attention_values):
+    """Rank tokens by attention and by position, so the two can be compared.
+
+    Input: user-token attention, in prompt order.
+
+    Returns (attn_rank, pos_rank), both 1-based with 1 meaning "most".
+
+    pos_rank counts BACKWARDS from the end: the last token is rank 1, the first
+    token is rank n. That is the order pure recency predicts, so a token whose
+    attn_rank is a SMALLER number than its pos_rank was attended more than its
+    position alone explains -- the signature of a meaning effect. Counting
+    pos_rank forwards instead would make the two columns agree almost everywhere
+    and hide the very thing being tested.
+    """
+
+    values = np.asarray(attention_values, dtype=np.float64)
+
+    n = values.size
+
+    if n == 0:
+        return np.zeros(0, dtype=int), np.zeros(0, dtype=int)
+
+    # rank 1 = highest attention; stable sort breaks ties by position.
+    order = np.argsort(-values, kind="stable")
+
+    attn_rank = np.empty(n, dtype=int)
+    attn_rank[order] = np.arange(1, n + 1)
+
+    pos_rank = np.arange(n, 0, -1)
+
+    return attn_rank, pos_rank
+
+
+def rank_correlation(a, b):
+    """Spearman correlation -- Pearson on the ranks, so no scipy needed.
+
+    Returns nan rather than 0.0 when either side is constant or too short: 0.0
+    would read as "measured, and unrelated", whereas the honest answer is "no
+    relationship is measurable here".
+    """
+
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+
+    if a.size < 2 or b.size < 2 or a.std() == 0 or b.std() == 0:
+        return float("nan")
+
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def repeated_token_groups(tokens, attention_values):
+    """Group positions by identical token -- the same word in different places.
+
+    A repeated token is a free control group: it means the same thing every time
+    it appears, so any attention difference between its occurrences must be
+    positional. The chat template is full of them -- the newline marker alone
+    appears five times.
+
+    Returns {token: [(position, attention), ...]}, for tokens appearing at least
+    twice.
+    """
+
+    groups = {}
+
+    for position, (token, value) in enumerate(zip(tokens, attention_values)):
+        groups.setdefault(token, []).append((position, float(value)))
+
+    return {token: occ for token, occ in groups.items() if len(occ) >= 2}
+
 test_prompt = prompts[TEST_PROMPT_INDEX]
 test_spec = PROMPT_SPECS[TEST_PROMPT_INDEX]
 
@@ -1047,27 +1158,73 @@ reasoning_sink_share, reasoning_sink_mass = sink_profile(reasoning_attn_np)
 n_layers, n_heads = ift_sink_share.shape
 
 print("\n" + "=" * 64)
-print("DETERMINISM CHECK (this run vs S1 run #2)")
+print(f"DETERMINISM CHECK -- {test_spec['prompt']}")
 print("=" * 64)
-print("Greedy decoding is reproducible, so these must match run #2 exactly. If")
-print("they do not, the cache or the pipeline changed and nothing below is")
-print("comparable to the earlier numbers.")
 
-print(
-    f"  trim          IFT {len(ift_attention_ids)}/{len(ift_generated_ids)}"
-    f" (expect 441/1024, period 39)"
-    f"   Reasoning {len(reasoning_attention_ids)}/{len(reasoning_generated_ids)}"
-    f" (expect 829/1024, period 1)"
-)
-print(
-    f"  token {SINK_INDEX} attention  IFT {float(ift_avg_attention[SINK_INDEX]):.4f}"
-    f" (expect 0.3950)"
-    f"   Reasoning {float(reasoning_avg_attention[SINK_INDEX]):.6f} (expect 0.359161)"
-)
-print(
-    f"  prompt mass   IFT {float(ift_avg_attention.sum()):.4f} (expect 0.4326)"
-    f"   Reasoning {float(reasoning_avg_attention.sum()):.4f} (expect 0.3891)"
-)
+expected = test_spec.get("expected")
+
+if expected is None:
+
+    # A prompt with no recorded baseline is not a failure -- it is the first
+    # measurement. Print the values so they can be pasted back into the spec,
+    # which turns the next run into a real check rather than a fresh start.
+    print("No baseline recorded for this prompt. Greedy decoding is reproducible,")
+    print("so these values should repeat exactly on the next run -- record them in")
+    print("PROMPT_SPECS['expected'] to turn that repetition into a real check.")
+
+    print(
+        f"  trim          IFT {len(ift_attention_ids)}/{len(ift_generated_ids)}"
+        f" (period {ift_degenerate_period})"
+        f"   Reasoning {len(reasoning_attention_ids)}/{len(reasoning_generated_ids)}"
+        f" (period {reasoning_degenerate_period})"
+    )
+    print(
+        f"  token {SINK_INDEX} attention  IFT {float(ift_avg_attention[SINK_INDEX]):.4f}"
+        f"   Reasoning {float(reasoning_avg_attention[SINK_INDEX]):.6f}"
+    )
+    print(
+        f"  prompt mass   IFT {float(ift_avg_attention.sum()):.4f}"
+        f"   Reasoning {float(reasoning_avg_attention.sum()):.4f}"
+    )
+
+else:
+
+    checks = [
+        (
+            "IFT trim (n_used, n_generated, period)",
+            (len(ift_attention_ids), len(ift_generated_ids), ift_degenerate_period),
+            expected["ift_trim"],
+        ),
+        (
+            "Reasoning trim (n_used, n_generated, period)",
+            (len(reasoning_attention_ids), len(reasoning_generated_ids), reasoning_degenerate_period),
+            expected["reasoning_trim"],
+        ),
+        ("IFT token 0 attention", float(ift_avg_attention[SINK_INDEX]), expected["ift_token0"]),
+        ("Reasoning token 0 attention", float(reasoning_avg_attention[SINK_INDEX]), expected["reasoning_token0"]),
+        ("IFT prompt mass", float(ift_avg_attention.sum()), expected["ift_mass"]),
+        ("Reasoning prompt mass", float(reasoning_avg_attention.sum()), expected["reasoning_mass"]),
+    ]
+
+    all_ok = True
+
+    for label, got, want in checks:
+
+        if isinstance(want, tuple):
+            ok = tuple(got) == tuple(want)
+        else:
+            # Attention goes through float32 on disk, so compare at recorded
+            # precision rather than for bit equality.
+            ok = abs(got - want) < 1e-4
+
+        all_ok = all_ok and ok
+
+        print(f"  {'ok  ' if ok else 'FAIL'} {label}: got {got}  expected {want}")
+
+    if all_ok:
+        print("\nReproduced exactly -- the cache and the pipeline are unchanged.")
+    else:
+        print("\nMISMATCH. Stop here: nothing below is comparable to the baseline.")
 
 print("\n" + "=" * 64)
 print("STAGE A1: SINK SHARE PER LAYER AND HEAD")
@@ -1251,5 +1408,151 @@ for threshold in (0.9, 0.5):
         f"\n  mean |Reasoning - IFT| across user tokens --"
         f" raw {mean_abs_raw:.5f}, rescaled {mean_abs_norm:.5f}"
     )
-    print("  (all-heads rescaled figure was 0.0122 on run #2)")
+    print("  (the France prompt, all heads, was 0.0122)")
+
+
+# ============================================================
+# STAGE B: IS ATTENTION JUST POSITION?
+# ============================================================
+#
+# The France prompt could not answer this. Its meaningful tokens ('France', '?')
+# were also its LAST tokens, so "meaning" and "recency" predicted the same thing
+# and no amount of analysis could pull them apart. The position-swap prompt moves
+# the answer word into the middle, where the two hypotheses disagree.
+#
+# Three reports, strongest evidence last:
+#
+#   B1  rank each user token by attention and by position. Where the rankings
+#       agree, the table is a recency ramp; where they disagree, something else
+#       is at work.
+#   B2  the same table labelled by ROLE (question word / filler / ANSWER), so two
+#       differently-worded prompts can be compared by what a token does rather
+#       than where it sits.
+#   B3  repeated tokens -- identical meaning at different positions. The cleanest
+#       test in the data, and it needs no new generation or new prompt.
+
+print("\n" + "=" * 64)
+print("STAGE B: IS ATTENTION JUST POSITION?")
+print("=" * 64)
+
+print(f"Prompt: {test_prompt}")
+
+ift_user_raw = ift_avg_attention[start:end].numpy()
+reasoning_user_raw = reasoning_avg_attention[start:end].numpy()
+
+ift_attn_rank, pos_rank = rank_positions_vs_attention(ift_user_raw)
+reasoning_attn_rank, _ = rank_positions_vs_attention(reasoning_user_raw)
+
+print("\nB1. Attention rank vs position rank  (pos_rank 1 = the LAST token)")
+print("    shift = pos_rank - attn_rank")
+print("      shift > 0  -> attended MORE than its position explains (meaning)")
+print("      shift ~ 0  -> attention is what position alone predicts")
+print("      shift < 0  -> attended LESS than its position explains")
+
+stage_b_df = pd.DataFrame({
+    "pos": list(range(len(user_tokens))),
+    "token": user_tokens,
+    "IFT_attn": ift_user_raw,
+    "IFT_rank": ift_attn_rank,
+    "pos_rank": pos_rank,
+    "IFT_shift": pos_rank - ift_attn_rank,
+    "R_attn": reasoning_user_raw,
+    "R_rank": reasoning_attn_rank,
+    "R_shift": pos_rank - reasoning_attn_rank,
+})
+
+roles = test_spec.get("roles")
+
+if roles and len(roles) == len(user_tokens):
+    stage_b_df.insert(1, "role", roles)
+elif roles:
+    print(
+        f"\nNOTE: the spec lists {len(roles)} roles but this prompt tokenizes to "
+        f"{len(user_tokens)} tokens, so the role column is omitted rather than "
+        f"guessed. Roles given: {roles}"
+    )
+
+display(stage_b_df)
+
+print("\nRank correlation between attention and position, per model:")
+print("  1.0 = a pure recency ramp. 0.0 = position explains nothing.")
+
+for label, attn_rank in (("IFT", ift_attn_rank), ("Reasoning", reasoning_attn_rank)):
+    print(f"  {label:10s}: {rank_correlation(attn_rank, pos_rank):+.3f}")
+
+print("\nThe token to look at is the ANSWER word. If it sits near the bottom of")
+print("the attention ranking while sitting in the MIDDLE of the prompt, then")
+print("position is driving the table and meaning is not.")
+
+
+# ------------------------------------------------------------
+# B3. The same token, at several different positions
+# ------------------------------------------------------------
+
+print("\n" + "-" * 64)
+print("B3. Identical tokens at different positions")
+print("-" * 64)
+print("A token that means the same thing every time it appears. Any attention")
+print("difference between its occurrences is positional by construction, so this")
+print("is the cleanest position test in the data -- no new prompt, no new run.")
+print("It also says whether the recency reading generalises beyond the question")
+
+ift_attn_all = ift_avg_attention.numpy()
+reasoning_attn_all = reasoning_avg_attention.numpy()
+
+ift_groups = repeated_token_groups(ift_tokens, ift_attn_all)
+reasoning_groups = repeated_token_groups(reasoning_tokens, reasoning_attn_all)
+
+repeated = sorted(
+    (token for token in ift_groups if token in reasoning_groups),
+    key=lambda token: -len(ift_groups[token]),
+)
+
+tested_any = False
+
+for token in repeated:
+
+    if len(ift_groups[token]) < 3:
+        continue
+
+    tested_any = True
+
+    print(f"\n{token!r} appears {len(ift_groups[token])} times")
+
+    for label, groups in (("IFT      ", ift_groups), ("Reasoning", reasoning_groups)):
+
+        positions = [position for position, _ in groups[token]]
+        values = [value for _, value in groups[token]]
+
+        shown = "   ".join(f"pos{position}={value:.5f}" for position, value in groups[token])
+
+        print(f"  {label}: {shown}")
+        print(
+            f"               correlation with position: "
+            f"{rank_correlation(positions, values):+.3f}"
+        )
+
+    # The sink appears more than once too, and its position-0 occurrence would
+    # dominate any correlation -- so flag it rather than let it masquerade as
+    # independent evidence.
+    if token == ift_tokens[SINK_INDEX]:
+        print(
+            "  NOTE: one of these occurrences IS the sink (position 0). A high"
+            " correlation here restates the sink finding, it does not corroborate"
+            " it."
+        )
+
+if not tested_any:
+    print("\nNo token repeats three or more times, so B3 has nothing to test.")
+
+print("\n" + "-" * 64)
+print("HOW TO READ STAGE B")
+print("-" * 64)
+print("  * ANSWER token ranks high, shift strongly positive -> meaning drives")
+print("    attention, and the token-level table in the main report is real.")
+print("  * Every shift near 0 and rank correlation near 1.0 -> position alone")
+print("    explains the table, and the IFT/Reasoning split is a recency effect")
+print("    rather than attention to content.")
+print("  * B3 breaks ties: identical tokens, so any spread there is positional by")
+print("    construction -- except for the sink, which is flagged.")
 

@@ -127,16 +127,12 @@ PROMPT_SPECS = [
         "roles": [
             "question", "filler", "filler", "answer-attr", "filler", "ANSWER", "punct",
         ],
-        # Recorded from the S1 France run. Reproducing these exactly is what
-        # makes the disk cache trustworthy rather than merely convenient.
-        "expected": {
-            "ift_trim": (441, 1024, 39),
-            "reasoning_trim": (829, 1024, 1),
-            "ift_token0": 0.3950,
-            "reasoning_token0": 0.359161,
-            "ift_mass": 0.4326,
-            "reasoning_mass": 0.3891,
-        },
+        # No `expected` block: the stop-condition fix changed generation itself
+        # (1024-token loops became a 9-token answer and a 300-token answer), so
+        # every baseline recorded before it is void. The old France values --
+        # trim (441, 1024, 39), token 0 0.3950, mass 0.4326 -- are in git
+        # history at the commit before "stop on the model's own turn
+        # terminator". The next run prints fresh values to record.
     },
     {
         "prompt": "If a train travels 60 kilometers in 1 hour, how far will it travel in 3 hours?",
@@ -170,17 +166,11 @@ PROMPT_SPECS = [
             "question", "question", "filler", "ANSWER",
             "filler", "filler", "answer-attr", "punct",
         ],
-        # Recorded from the S2 position-swap run, which printed these and asked
-        # for them back. Note the numbers are measured under the PERIODIC-TAIL
-        # rule alone; see the determinism-check block below for why.
-        "expected": {
-            "ift_trim": (264, 1024, 1),
-            "reasoning_trim": (683, 1024, 1),
-            "ift_token0": 0.3812,
-            "reasoning_token0": 0.367706,
-            "ift_mass": 0.4534,
-            "reasoning_mass": 0.4079,
-        },
+        # No `expected` block, for the same reason as index 0: the stop-condition
+        # fix changed generation. The S2 swap values -- trim (264, 1024, 1) and
+        # (683, 1024, 1), token 0 0.3812 and 0.367706, mass 0.4534 and 0.4079 --
+        # are in git history at the commit before the fix. The next run prints
+        # fresh values to record.
     },
 ]
 
@@ -318,10 +308,36 @@ def find_degenerate_tail(generated_ids, max_period=256, min_run_tokens=40):
     return best_start, best_period
 
 
+# Tokens that END a reply, passed to generate() as eos_token_id.
+#
+# Why this exists: both models were generating to the 1024-token cap, and the
+# loops that followed ('iziñiziz...' for IFT, 'übübüb...' for Reasoning) looked
+# like a model defect. They are not. The diagnostic window showed IFT emitting
+# '<|im_end|>' at generated token 9 -- right after 'Paris is the capital of
+# **France**.' -- and Reasoning emitting it at token 300, right after
+# '**Answer:** France.'. Both models signalled stop at their natural end.
+#
+# generate() was never told what that signal was. The tokenizer reports
+# eos_token_id 151645 ('<|im_end|>'), but generate() reads the MODEL's
+# generation_config, which evidently does not include it, so the stop token was
+# just another token. Every loop we spent two sessions building detectors for
+# was a reply that had already finished.
+#
+# '<|im_start|>' is deliberately NOT here: it opens a turn rather than ending
+# one, and stopping on it would cut off a generation that had legitimately
+# begun a new turn. It stays in TURN_BOUNDARY_TOKENS, where it is a drift
+# signal rather than a stop.
+STOP_TOKEN_STRINGS = ("<|im_end|>", "<|endoftext|>")
+
+
 # Chat control tokens that should never appear inside a single-turn answer.
 # If the model emits one, it has closed its own reply and opened a new turn --
 # it is role-playing the conversation continuing, and everything after that
 # point is not the model answering the question.
+#
+# With the stop condition fixed this should now be a guard that never fires.
+# It is kept because a guard that never fires is cheap, and because a silent
+# regression in the stop set would otherwise be invisible.
 TURN_BOUNDARY_TOKENS = ("<|im_end|>", "<|im_start|>", "<|endoftext|>")
 
 
@@ -345,6 +361,33 @@ def turn_boundary_ids(tokenizer):
             continue
 
         ids.add(token_id)
+
+    return ids
+
+
+def stop_token_ids(tokenizer):
+    """Ids that should end generation, for generate(eos_token_id=...).
+
+    A DIFFERENT set from turn_boundary_ids(): '<|im_start|>' is excluded here
+    because it opens a turn rather than ending one.
+
+    Returns a list, not a set, because generate() also accepts a single int and
+    an order-stable list keeps the value easy to print and to fold into the
+    cache key. Duplicates are dropped in case a tokenizer maps two of these
+    strings to the same id.
+    """
+
+    ids = []
+
+    for token in STOP_TOKEN_STRINGS:
+
+        token_id = tokenizer.convert_tokens_to_ids(token)
+
+        if token_id is None or token_id == tokenizer.unk_token_id:
+            continue
+
+        if token_id not in ids:
+            ids.append(token_id)
 
     return ids
 
@@ -420,14 +463,23 @@ def resolve_attention_trim(
 
     if drift_start is None:
         print(
-            f"  drift : none -- no chat turn markers in {n_generated} tokens, "
-            "so the model never started inventing further turns"
+            f"  stop  : no turn terminator in {n_generated} tokens, so the model "
+            "was still mid-reply when generation ended"
+        )
+    elif drift_start == n_generated - 1:
+        # The terminator is the LAST generated token, so generation stopped on
+        # it. That is the model ending its own reply, not drift -- and telling
+        # the two apart is the whole reason this branch exists. Post-fix this
+        # is the expected case; the drift branch below should be dead.
+        print(
+            f"  stop  : clean stop on a turn terminator at token {drift_start} of "
+            f"{n_generated} -- the model ended its own reply"
         )
     else:
         print(
-            f"  drift : assistant-turn drift at generated token {drift_start} of "
-            f"{n_generated} -- the model closed its reply and began writing more "
-            "conversation turns"
+            f"  drift : the model ended its reply at token {drift_start} of "
+            f"{n_generated} and then kept generating -- everything after that "
+            "point is not an answer"
         )
 
     if degenerate_start is None:
@@ -515,12 +567,25 @@ def generate_response(model, tokenizer, prompt):
 
     prompt_length = inputs["input_ids"].shape[1]
 
+    # The model's own eos is printed rather than trusted. It is the reason the
+    # previous runs went to the token cap: whatever this says, it was missing
+    # the chat turn terminator, so the model's stop signal was ignored.
+    configured_eos = getattr(model.generation_config, "eos_token_id", None)
+
+    stop_ids = stop_token_ids(tokenizer)
+
+    print(
+        f"Stop condition: tokenizer gives {stop_ids}"
+        f"   (model config eos was {configured_eos})"
+    )
+
     output_ids = model.generate(
         **inputs,
         max_new_tokens=MAX_NEW_TOKENS,
         do_sample=False,
         use_cache=True,
-        pad_token_id=tokenizer.pad_token_id
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=stop_ids,
     )
 
     generated_ids = output_ids[0, prompt_length:]
@@ -670,14 +735,23 @@ def average_prompt_attention(attention_tensor):
     return attention_tensor.mean(dim=(0, 1, 2))
 
 
-def cache_path(which, prompt):
-    """Cache file for one (model, prompt, token cap) combination.
+def cache_path(which, prompt, stop_strings=STOP_TOKEN_STRINGS):
+    """Cache file for one (model, prompt, stop set, token cap) combination.
 
-    The cap is in the filename, so raising MAX_NEW_TOKENS invalidates the cache
-    rather than silently reusing a run that stopped earlier.
+    The cap AND the stop set are both folded into the digest, so changing either
+    invalidates the cache instead of silently serving a run produced under
+    different conditions.
+
+    That is not hypothetical: adding '<|im_end|>' to the stop set turns a
+    1024-token loop into a 9-token answer. Reusing the old file would have made
+    the fix look like it did nothing. Folding the stop strings into the hash
+    rather than into the filename keeps old files quietly unused rather than
+    piling up unreadable names.
     """
 
-    digest = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:12]
+    key = prompt + "\x00" + ",".join(sorted(stop_strings))
+
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
 
     return os.path.join(CACHE_DIR, f"{which}_{digest}_{MAX_NEW_TOKENS}.npz")
 

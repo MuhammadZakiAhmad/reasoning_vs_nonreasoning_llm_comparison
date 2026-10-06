@@ -18,8 +18,10 @@ Original notebook:
     https://colab.research.google.com/drive/1eezvrVvmYXf_veCtAFr6CNu1y9M-w_VG
 """
 
+import hashlib
 import os
 import sys
+import tempfile
 
 # Make the repo root importable when this file is executed via %run in Colab.
 if os.getcwd() not in sys.path:
@@ -44,6 +46,25 @@ from models import get_model
 # token, so runtime is linear in generated length -- 1024 is roughly 4x the
 # work of 256, per model.
 MAX_NEW_TOKENS = 1024
+
+# Where a completed (generation + attention) run is cached, for the life of the
+# Colab VM.
+#
+# Why this exists: `%run` re-executes this whole file, and the attention
+# collection costs one forward pass per generated token -- over 2000 passes for
+# the two models at a 1024-token cap. Without a cache, changing a single print
+# statement costs a full regeneration. With one, only the first run in a kernel
+# pays that, and every later run reads the tensor off disk in well under a
+# second.
+#
+# Deliberately NOT written into the repo: the cache is a throwaway, nothing
+# reads it but this script, and a stale file must never be mistaken for source.
+# On Colab it lands in /content, which is wiped when the VM dies -- so like the
+# model cache in models.py, it is per-kernel-session by construction.
+if os.path.isdir("/content"):
+    CACHE_DIR = "/content/attn_cache"
+else:
+    CACHE_DIR = os.path.join(tempfile.gettempdir(), "attn_cache")
 
 # Which entry of PROMPT_SPECS to analyse.
 #
@@ -420,6 +441,159 @@ def average_prompt_attention(attention_tensor):
 
     return attention_tensor.mean(dim=(0, 1, 2))
 
+
+def cache_path(which, prompt):
+    """Cache file for one (model, prompt, token cap) combination.
+
+    The cap is in the filename, so raising MAX_NEW_TOKENS invalidates the cache
+    rather than silently reusing a run that stopped earlier.
+    """
+
+    digest = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:12]
+
+    return os.path.join(CACHE_DIR, f"{which}_{digest}_{MAX_NEW_TOKENS}.npz")
+
+
+def run_and_cache(which, model, tokenizer, prompt):
+    """Generate, collect attention, and cache the result on disk.
+
+    Returns prompt_ids / generated_ids / text / attention / trim_start /
+    trim_period.
+
+    The attention is collected over the FULL untrimmed generation. That is the
+    point of the cache: a generated token's attention depends only on itself and
+    the tokens before it, so row i is identical whether the run stopped at 1024
+    tokens or at 400. Paying for the full collection once therefore makes every
+    future change to the trim rule free -- including the drift-boundary trim on
+    the wish list. Averaging over a prefix of the tensor reproduces exactly what
+    collecting only that prefix would have produced.
+    """
+
+    path = cache_path(which, prompt)
+
+    if os.path.exists(path):
+
+        cached = np.load(path, allow_pickle=False)
+
+        trim_start = int(cached["trim_start"])
+
+        print(f"{which}: reusing cached run ({os.path.basename(path)})")
+
+        return {
+            "prompt_ids": torch.from_numpy(cached["prompt_ids"]),
+            "generated_ids": torch.from_numpy(cached["generated_ids"]),
+            "text": str(cached["text"]),
+            "attention": torch.from_numpy(cached["attention"]),
+            "trim_start": None if trim_start < 0 else trim_start,
+            "trim_period": None if int(cached["trim_period"]) < 0 else int(cached["trim_period"]),
+        }
+
+    prompt_ids, generated_ids, text = generate_response(model, tokenizer, prompt)
+
+    print(f"\nCollecting {which} attention (full untrimmed generation)...")
+
+    attention = collect_prompt_attention(model, tokenizer, prompt, generated_ids)
+
+    print(f"{which} attention tensor shape:", tuple(attention.shape))
+
+    trim_start, trim_period = find_degenerate_tail(generated_ids)
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+    np.savez(
+        path,
+        prompt_ids=prompt_ids.numpy(),
+        generated_ids=generated_ids.numpy(),
+        text=np.array(text),
+        attention=attention.numpy().astype(np.float32),
+        trim_start=-1 if trim_start is None else trim_start,
+        trim_period=-1 if trim_period is None else trim_period,
+    )
+
+    print(f"{which}: cached run to {os.path.basename(path)}")
+
+    return {
+        "prompt_ids": prompt_ids,
+        "generated_ids": generated_ids,
+        "text": text,
+        "attention": attention,
+        "trim_start": trim_start,
+        "trim_period": trim_period,
+    }
+
+
+# ============================================================
+# STAGE A HELPERS: WHO IS A SINK HEAD, AND WHO IS A READER?
+# ============================================================
+#
+# Everything the headline comparison does averages over all 28 layers and all 12
+# heads at once -- 336 heads mashed into one number per prompt token. Most of
+# those heads turn out to park their attention on prompt token 0 and carry no
+# information, so that average is dominated by the parking and the IFT-vs-
+# Reasoning gap is largely a gap in sink size.
+#
+# These two functions exist to break the average apart. Both take a plain numpy
+# array so they can be unit-tested locally without torch or the models.
+
+# Position 0 of the rendered chat template: '<|im_start|>'. The classic
+# attention sink -- always visible, positionally stable, semantically empty.
+SINK_INDEX = 0
+
+
+def sink_profile(attention, sink_index=SINK_INDEX):
+    """Sink share and total prompt attention, per (layer, head).
+
+    Input: [generated_tokens, layers, heads, prompt_tokens].
+
+    share[l, h] is the fraction of head (l, h)'s prompt attention that lands on
+    sink_index. mass[l, h] is how much prompt attention that head carried in the
+    first place.
+
+    Both numbers matter. A head with share 0.05 and mass 0.0001 is a reader, but
+    not a loud one, and a 5% reader holding almost no attention cannot carry a
+    comparison on its own.
+    """
+
+    per_head = attention.mean(axis=0)
+
+    mass = per_head.sum(axis=-1)
+
+    share = np.divide(
+        per_head[..., sink_index],
+        mass,
+        out=np.zeros_like(mass),
+        where=mass > 0
+    )
+
+    return share, mass
+
+
+def keep_reader_heads(attention, share, threshold, sink_index=SINK_INDEX):
+    """Average prompt attention using only the heads that are not sink-dominant.
+
+    Returns (prompt_vector, retained_share_of_mass, kept, total_heads).
+
+    retained_share_of_mass is the number to read first. If the readers hold only
+    a percent or two of the total, then the comparison built on them is a
+    comparison of a percent or two of the signal, and should be reported that
+    way rather than as if it were the whole picture.
+
+    Note the sink is zeroed rather than renormalized away: dropping the sink's
+    mass and rescaling would hide exactly the quantity we are trying to see.
+    """
+
+    keep = share < threshold
+
+    per_head = attention.mean(axis=0) * keep[..., None]
+
+    prompt_vector = per_head.sum(axis=(0, 1))
+
+    total = attention.mean(axis=0).sum()
+
+    retained = float(per_head.sum() / total) if total > 0 else 0.0
+
+    return prompt_vector, retained, int(keep.sum()), int(keep.size)
+
 test_prompt = prompts[TEST_PROMPT_INDEX]
 test_spec = PROMPT_SPECS[TEST_PROMPT_INDEX]
 
@@ -428,11 +602,11 @@ print(test_prompt)
 
 print("\nGenerating with IFT model...")
 
-ift_prompt_ids, ift_generated_ids, ift_text = generate_response(
-    ift_model,
-    ift_tokenizer,
-    test_prompt
-)
+ift_run = run_and_cache("ift", ift_model, ift_tokenizer, test_prompt)
+
+ift_prompt_ids = ift_run["prompt_ids"]
+ift_generated_ids = ift_run["generated_ids"]
+ift_text = ift_run["text"]
 
 print("\nIFT RESPONSE:")
 print(ift_text)
@@ -446,7 +620,8 @@ print(ift_text)
 # ~30-token sentence, well beyond any small fixed n-gram window. It now sweeps
 # the period instead, so the loop is caught and the reported period says what
 # kind of loop it was.
-ift_degenerate_start, ift_degenerate_period = find_degenerate_tail(ift_generated_ids)
+ift_degenerate_start = ift_run["trim_start"]
+ift_degenerate_period = ift_run["trim_period"]
 
 if ift_degenerate_start is None:
     ift_attention_ids = ift_generated_ids
@@ -463,14 +638,10 @@ else:
 if len(ift_attention_ids) == 0:
     raise RuntimeError("IFT generation collapsed immediately; nothing to average.")
 
-print("\nCollecting IFT attention...")
-
-ift_attention = collect_prompt_attention(
-    ift_model,
-    ift_tokenizer,
-    test_prompt,
-    ift_attention_ids
-)
+# Rows of the cached tensor line up with generated tokens, so trimming is a
+# slice of the tensor -- no re-collection. Change the slice and re-`%run` and
+# the cache serves it back instantly.
+ift_attention = ift_run["attention"][:len(ift_attention_ids)]
 
 print("\nAttention tensor shape:")
 print(ift_attention.shape)
@@ -521,11 +692,16 @@ print(test_prompt)
 
 print("\nGenerating with reasoning model...")
 
-reasoning_prompt_ids, reasoning_generated_ids, reasoning_text = generate_response(
+reasoning_run = run_and_cache(
+    "reasoning",
     reasoning_model,
     reasoning_tokenizer,
     test_prompt
 )
+
+reasoning_prompt_ids = reasoning_run["prompt_ids"]
+reasoning_generated_ids = reasoning_run["generated_ids"]
+reasoning_text = reasoning_run["text"]
 
 print("\nREASONING RESPONSE:")
 print(reasoning_text)
@@ -587,9 +763,8 @@ print(
 
 print("=" * 64)
 
-reasoning_degenerate_start, reasoning_degenerate_period = find_degenerate_tail(
-    reasoning_generated_ids
-)
+reasoning_degenerate_start = reasoning_run["trim_start"]
+reasoning_degenerate_period = reasoning_run["trim_period"]
 
 if reasoning_degenerate_start is None:
     reasoning_attention_ids = reasoning_generated_ids
@@ -606,14 +781,7 @@ else:
 if len(reasoning_attention_ids) == 0:
     raise RuntimeError("Reasoning generation collapsed immediately; nothing to average.")
 
-print("\nCollecting reasoning attention...")
-
-reasoning_attention = collect_prompt_attention(
-    reasoning_model,
-    reasoning_tokenizer,
-    test_prompt,
-    reasoning_attention_ids
-)
+reasoning_attention = reasoning_run["attention"][:len(reasoning_attention_ids)]
 
 reasoning_avg_attention = average_prompt_attention(
     reasoning_attention
@@ -820,4 +988,213 @@ comparison["Reasoning_minus_IFT"] = (
 
 # 8. Display
 display(comparison)
+
+
+# ============================================================
+# STAGE A: WHERE DOES PROMPT ATTENTION ACTUALLY GO?
+# ============================================================
+#
+# Every number above averages over all 28 layers and all 12 heads at once. The
+# reports below break that average apart, in increasing order of how much they
+# change what can be said:
+#
+#   A1  sink share per (layer, head) -- is the sink concentrated in a few heads
+#       (a clean split, so dropping them is meaningful) or spread across nearly
+#       all of them (no clean split, so any threshold is arbitrary)?
+#   A2  sink share per layer -- are the early layers the sink, as the literature
+#       reports, leaving the middle layers readable?
+#   A3  redo the comparison using only the NON-sink heads. This is the one that
+#       decides whether "IFT looks at the prompt more" survives.
+#
+# Working on the TRIMMED tensor, so a repetition loop cannot skew a head's share
+# the way it skewed the whole-model average.
+
+ift_attn_np = ift_attention.numpy()
+reasoning_attn_np = reasoning_attention.numpy()
+
+ift_sink_share, ift_sink_mass = sink_profile(ift_attn_np)
+reasoning_sink_share, reasoning_sink_mass = sink_profile(reasoning_attn_np)
+
+n_layers, n_heads = ift_sink_share.shape
+
+print("\n" + "=" * 64)
+print("DETERMINISM CHECK (this run vs S1 run #2)")
+print("=" * 64)
+print("Greedy decoding is reproducible, so these must match run #2 exactly. If")
+print("they do not, the cache or the pipeline changed and nothing below is")
+print("comparable to the earlier numbers.")
+
+print(
+    f"  trim          IFT {len(ift_attention_ids)}/{len(ift_generated_ids)}"
+    f" (expect 441/1024, period 39)"
+    f"   Reasoning {len(reasoning_attention_ids)}/{len(reasoning_generated_ids)}"
+    f" (expect 829/1024, period 1)"
+)
+print(
+    f"  token {SINK_INDEX} attention  IFT {float(ift_avg_attention[SINK_INDEX]):.4f}"
+    f" (expect 0.3950)"
+    f"   Reasoning {float(reasoning_avg_attention[SINK_INDEX]):.6f} (expect 0.359161)"
+)
+print(
+    f"  prompt mass   IFT {float(ift_avg_attention.sum()):.4f} (expect 0.4326)"
+    f"   Reasoning {float(reasoning_avg_attention.sum()):.4f} (expect 0.3891)"
+)
+
+print("\n" + "=" * 64)
+print("STAGE A1: SINK SHARE PER LAYER AND HEAD")
+print("=" * 64)
+
+print(f"Sink = prompt token {SINK_INDEX} ({ift_tokens[SINK_INDEX]!r}), the first")
+print("token of the rendered chat template. Each cell is the fraction of that")
+print("head's prompt attention that lands on the sink.")
+print("  1.00 = pure sink head, holds no information about the question")
+print("  0.00 = never looks at the sink at all")
+
+ift_share_df = pd.DataFrame(
+    ift_sink_share.round(2),
+    columns=[f"h{h}" for h in range(n_heads)]
+)
+
+ift_share_df.insert(0, "layer", range(n_layers))
+
+display(ift_share_df)
+
+print("\nHow many IFT heads are sink-dominant?")
+for threshold in (0.9, 0.75, 0.5, 0.2):
+    n = int((ift_sink_share > threshold).sum())
+    print(
+        f"  share > {threshold:<5}: {n:3d} of {ift_sink_share.size} heads"
+        f" ({100 * n / ift_sink_share.size:5.1f}%)"
+    )
+
+# The shape of the distribution is the real question, not any one threshold: a
+# two-hump distribution means sink heads and reader heads are genuinely distinct
+# groups, so a threshold cuts between them. One smear means there is no such
+# split and the threshold is picking an arbitrary line.
+edges = np.linspace(0.0, 1.0, 11)
+counts, _ = np.histogram(ift_sink_share, bins=edges)
+
+print("\nDistribution of IFT sink shares. Two humps = a real split; one fat")
+print("hump = any threshold is arbitrary:")
+
+for lo, hi, count in zip(edges[:-1], edges[1:], counts):
+    bar = "#" * int(round(count / max(counts.max(), 1) * 40))
+    print(f"  {lo:.1f}-{hi:.1f}  {count:3d}  {bar}")
+
+print("\n" + "=" * 64)
+print("STAGE A2: SINK SHARE PER LAYER")
+print("=" * 64)
+
+layer_df = pd.DataFrame({
+    "layer": range(n_layers),
+    "IFT_mean_sink_share": ift_sink_share.mean(axis=1).round(3),
+    "Reasoning_mean_sink_share": reasoning_sink_share.mean(axis=1).round(3),
+    "IFT_heads_above_0.5": (ift_sink_share > 0.5).sum(axis=1),
+    "Reasoning_heads_above_0.5": (reasoning_sink_share > 0.5).sum(axis=1),
+})
+
+display(layer_df)
+
+print("\nWhere the prompt attention mass actually sits, per layer:")
+print("(mass = that layer's total prompt attention, before any normalization)")
+
+layer_mass_df = pd.DataFrame({
+    "layer": range(n_layers),
+    "IFT_mass": ift_sink_mass.sum(axis=1).round(5),
+    "Reasoning_mass": reasoning_sink_mass.sum(axis=1).round(5),
+})
+
+display(layer_mass_df)
+
+print("\n" + "=" * 64)
+print("STAGE A3: THE COMPARISON WITH SINK HEADS REMOVED")
+print("=" * 64)
+
+ift_full_mass = float(ift_avg_attention.sum())
+reasoning_full_mass = float(reasoning_avg_attention.sum())
+
+print(
+    f"Prompt mass, all heads -- IFT {ift_full_mass:.4f}"
+    f"   Reasoning {reasoning_full_mass:.4f}"
+)
+print(
+    f"  of which the sink alone is"
+    f" IFT {float(ift_avg_attention[SINK_INDEX]):.4f}"
+    f" ({100 * float(ift_avg_attention[SINK_INDEX]) / ift_full_mass:.1f}%)"
+    f"   Reasoning {float(reasoning_avg_attention[SINK_INDEX]):.4f}"
+    f" ({100 * float(reasoning_avg_attention[SINK_INDEX]) / reasoning_full_mass:.1f}%)"
+)
+
+# Two thresholds on purpose. A finding that holds at both is robust; a finding
+# that flips between them was a property of the threshold, not of the models.
+for threshold in (0.9, 0.5):
+
+    ift_vec, ift_retained, ift_kept, ift_total = keep_reader_heads(
+        ift_attn_np, ift_sink_share, threshold
+    )
+
+    reasoning_vec, reasoning_retained, reasoning_kept, reasoning_total = (
+        keep_reader_heads(reasoning_attn_np, reasoning_sink_share, threshold)
+    )
+
+    print("\n" + "-" * 64)
+    print(f"Threshold: drop heads whose sink share exceeds {threshold}")
+
+    print(
+        f"  IFT       kept {ift_kept:3d}/{ift_total} heads,"
+        f" holding {100 * ift_retained:6.2f}% of prompt attention"
+    )
+    print(
+        f"  Reasoning kept {reasoning_kept:3d}/{reasoning_total} heads,"
+        f" holding {100 * reasoning_retained:6.2f}% of prompt attention"
+    )
+
+    print(
+        f"  prompt mass with sinks dropped -- IFT {ift_vec.sum():.4f}"
+        f"   Reasoning {reasoning_vec.sum():.4f}"
+    )
+
+    # Same user-prompt window as the table at the top of the file: `start` and
+    # `end` are the location of the raw user prompt inside the chat template,
+    # found above.
+    ift_user = ift_vec[start:end]
+    reasoning_user = reasoning_vec[start:end]
+
+    reader_df = pd.DataFrame({
+        "token": user_tokens,
+        "IFT_attention": ift_user,
+        "Reasoning_attention": reasoning_user,
+    })
+
+    reader_df["Reasoning_minus_IFT"] = (
+        reader_df["Reasoning_attention"] - reader_df["IFT_attention"]
+    )
+
+    print("\n  reader heads only, raw (unnormalized) attention per user token:")
+    display(reader_df)
+
+    mean_abs_raw = float(np.abs(reader_df["Reasoning_minus_IFT"]).mean())
+
+    ift_denom = float(ift_user.sum())
+    reasoning_denom = float(reasoning_user.sum())
+
+    if ift_denom > 0 and reasoning_denom > 0:
+        diff_norm = reasoning_user / reasoning_denom - ift_user / ift_denom
+        mean_abs_norm = float(np.abs(diff_norm).mean())
+
+        print("\n  reader heads only, each column rescaled to sum to 1:")
+        display(pd.DataFrame({
+            "token": user_tokens,
+            "IFT_attention": ift_user / ift_denom,
+            "Reasoning_attention": reasoning_user / reasoning_denom,
+            "Reasoning_minus_IFT": diff_norm,
+        }))
+    else:
+        mean_abs_norm = float("nan")
+
+    print(
+        f"\n  mean |Reasoning - IFT| across user tokens --"
+        f" raw {mean_abs_raw:.5f}, rescaled {mean_abs_norm:.5f}"
+    )
+    print("  (all-heads rescaled figure was 0.0122 on run #2)")
 

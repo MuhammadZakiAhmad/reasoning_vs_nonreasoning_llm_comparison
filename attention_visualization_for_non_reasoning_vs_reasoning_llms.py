@@ -162,7 +162,7 @@ PROMPT_SPECS = [
         # The position-swap probe. Same question as index 0, reversed, so the
         # answer word sits in the middle instead of at the end. If attention
         # tracks meaning, 'Paris' is high; if it tracks recency, 'Paris' is low
-        # and the tail wins again. No `expected` block: this run establishes one.
+        # and the tail wins again.
         "prompt": "Which country has Paris as its capital?",
         "ground_truth": "France",
         "must_contain": ["france"],
@@ -170,6 +170,17 @@ PROMPT_SPECS = [
             "question", "question", "filler", "ANSWER",
             "filler", "filler", "answer-attr", "punct",
         ],
+        # Recorded from the S2 position-swap run, which printed these and asked
+        # for them back. Note the numbers are measured under the PERIODIC-TAIL
+        # rule alone; see the determinism-check block below for why.
+        "expected": {
+            "ift_trim": (264, 1024, 1),
+            "reasoning_trim": (683, 1024, 1),
+            "ift_token0": 0.3812,
+            "reasoning_token0": 0.367706,
+            "ift_mass": 0.4534,
+            "reasoning_mass": 0.4079,
+        },
     },
 ]
 
@@ -305,6 +316,138 @@ def find_degenerate_tail(generated_ids, max_period=256, min_run_tokens=40):
                 best_period = period
 
     return best_start, best_period
+
+
+# Chat control tokens that should never appear inside a single-turn answer.
+# If the model emits one, it has closed its own reply and opened a new turn --
+# it is role-playing the conversation continuing, and everything after that
+# point is not the model answering the question.
+TURN_BOUNDARY_TOKENS = ("<|im_end|>", "<|im_start|>", "<|endoftext|>")
+
+
+def turn_boundary_ids(tokenizer):
+    """Token ids for the chat turn markers, skipping any the tokenizer lacks.
+
+    Passing the id set in (rather than the tokenizer) keeps find_drift_start()
+    a pure function of plain ints, so it can be tested without loading a model.
+    """
+
+    ids = set()
+
+    for token in TURN_BOUNDARY_TOKENS:
+
+        token_id = tokenizer.convert_tokens_to_ids(token)
+
+        # A tokenizer that lacks the marker returns the unknown-token id, and on
+        # some tokenizers unk_token_id is itself None. Either way, skip it --
+        # adding a bogus id would cut every generation at the first real token.
+        if token_id is None or token_id == tokenizer.unk_token_id:
+            continue
+
+        ids.add(token_id)
+
+    return ids
+
+
+def find_drift_start(generated_ids, boundary_ids):
+    """Index of the first generated turn-boundary token, or None.
+
+    Deliberately separate from find_degenerate_tail(), because the two catch
+    different failures and neither implies the other:
+
+      * find_degenerate_tail -- the model finishes, then repeats a fixed phrase
+        forever. Caught by periodicity, and only in the TAIL.
+      * find_drift_start -- the model finishes, then keeps going by inventing
+        further conversation turns. NOT periodic, so the tail detector is blind
+        to it by construction.
+
+    The second failure was the big one on the France run: IFT's kept 441 tokens
+    held roughly 50 tokens of answer and 390 of chat role-play, and one faked
+    block repeated twice inside the kept prefix. Cutting here is what makes the
+    average describe the model answering rather than the model chatting.
+    """
+
+    ids = (
+        generated_ids.tolist()
+        if hasattr(generated_ids, "tolist")
+        else list(generated_ids)
+    )
+
+    boundary_ids = set(boundary_ids)
+
+    for index, token_id in enumerate(ids):
+
+        if token_id in boundary_ids:
+            return index
+
+    return None
+
+
+def earliest_trim(drift_start, degenerate_start):
+    """The earlier of the two cut points, treating None as 'no cut'.
+
+    Both detectors can fire on one run, and either can fire alone. The average
+    must stop at whichever comes first -- otherwise a chat-drift block sitting
+    before a clean loop would still be averaged in.
+    """
+
+    cuts = [cut for cut in (drift_start, degenerate_start) if cut is not None]
+
+    return min(cuts) if cuts else None
+
+
+def resolve_attention_trim(
+    label,
+    generated_ids,
+    boundary_ids,
+    degenerate_start,
+    degenerate_period,
+):
+    """How many leading generated tokens the average may use, and why.
+
+    One place decides the trim for both models, so the two cannot silently
+    drift apart -- which is how the sink-column bug survived review earlier.
+    Returns the count; the caller slices.
+    """
+
+    drift_start = find_drift_start(generated_ids, boundary_ids)
+    trim_start = earliest_trim(drift_start, degenerate_start)
+
+    n_generated = len(generated_ids)
+    n_used = n_generated if trim_start is None else trim_start
+
+    print(f"\n{label} attention window:")
+
+    if drift_start is None:
+        print(
+            f"  drift : none -- no chat turn markers in {n_generated} tokens, "
+            "so the model never started inventing further turns"
+        )
+    else:
+        print(
+            f"  drift : assistant-turn drift at generated token {drift_start} of "
+            f"{n_generated} -- the model closed its reply and began writing more "
+            "conversation turns"
+        )
+
+    if degenerate_start is None:
+        print("  loop  : none -- generation never became periodic")
+    else:
+        print(
+            f"  loop  : periodic collapse at generated token {degenerate_start} "
+            f"of {n_generated} (period {degenerate_period} tokens)"
+        )
+
+    if trim_start is None:
+        print(f"  -> using all {n_used} generated tokens")
+    else:
+        print(
+            f"  -> using the first {n_used} of {n_generated} tokens; the "
+            f"remaining {n_generated - n_used} are excluded from the average"
+        )
+
+    return n_used
+
 
 @torch.no_grad()
 def generate_response(model, tokenizer, prompt):
@@ -500,9 +643,14 @@ def run_and_cache(which, model, tokenizer, prompt):
     point of the cache: a generated token's attention depends only on itself and
     the tokens before it, so row i is identical whether the run stopped at 1024
     tokens or at 400. Paying for the full collection once therefore makes every
-    future change to the trim rule free -- including the drift-boundary trim on
-    the wish list. Averaging over a prefix of the tensor reproduces exactly what
-    collecting only that prefix would have produced.
+    future change to the trim rule free -- which is exactly what the
+    drift-boundary trim added in S2 cost: nothing, on already-cached prompts.
+    Averaging over a prefix of the tensor reproduces exactly what collecting
+    only that prefix would have produced.
+
+    Only the PERIODIC-TAIL trim is stored in the cache file. Drift cutting is
+    derived from generated_ids at read time, so adding or changing it does not
+    invalidate an existing .npz.
     """
 
     path = cache_path(which, prompt)
@@ -756,24 +904,23 @@ print(ift_text)
 # line and then chats to the cap, so without this its average is mostly a
 # conversation loop.
 #
-# The old n-gram version of this check MISSED that loop: the repeated unit is a
-# ~30-token sentence, well beyond any small fixed n-gram window. It now sweeps
-# the period instead, so the loop is caught and the reported period says what
-# kind of loop it was.
+# Two independent failures are cut here, because the France run showed that one
+# detector cannot see both (see find_drift_start / find_degenerate_tail for the
+# full account). resolve_attention_trim() applies both and reports which fired.
 ift_degenerate_start = ift_run["trim_start"]
 ift_degenerate_period = ift_run["trim_period"]
 
-if ift_degenerate_start is None:
-    ift_attention_ids = ift_generated_ids
-    print(f"\nNo repetition collapse. Using all {len(ift_generated_ids)} generated tokens.")
-else:
-    ift_attention_ids = ift_generated_ids[:ift_degenerate_start]
-    print(
-        f"\nREPETITION COLLAPSE at generated token {ift_degenerate_start} of "
-        f"{len(ift_generated_ids)} (period {ift_degenerate_period} tokens). "
-        f"Attention uses only the first {len(ift_attention_ids)} tokens -- the "
-        "loop is excluded."
-    )
+ift_boundary_ids = turn_boundary_ids(ift_tokenizer)
+
+ift_attention_count = resolve_attention_trim(
+    "IFT",
+    ift_generated_ids,
+    ift_boundary_ids,
+    ift_degenerate_start,
+    ift_degenerate_period,
+)
+
+ift_attention_ids = ift_generated_ids[:ift_attention_count]
 
 if len(ift_attention_ids) == 0:
     raise RuntimeError("IFT generation collapsed immediately; nothing to average.")
@@ -906,17 +1053,21 @@ print("=" * 64)
 reasoning_degenerate_start = reasoning_run["trim_start"]
 reasoning_degenerate_period = reasoning_run["trim_period"]
 
-if reasoning_degenerate_start is None:
-    reasoning_attention_ids = reasoning_generated_ids
-    print(f"\nNo repetition collapse. Using all {len(reasoning_generated_ids)} generated tokens.")
-else:
-    reasoning_attention_ids = reasoning_generated_ids[:reasoning_degenerate_start]
-    print(
-        f"\nREPETITION COLLAPSE at generated token {reasoning_degenerate_start} of "
-        f"{len(reasoning_generated_ids)} (period {reasoning_degenerate_period} tokens). "
-        f"Attention uses only the first {len(reasoning_attention_ids)} tokens -- the "
-        "loop is excluded."
-    )
+# Same two cut points as IFT, applied by the same function so the two models
+# cannot drift apart. The reasoning model may well have no turn markers at all
+# -- it closes its trace and answers -- in which case only the loop trim fires
+# and nothing changes for it.
+reasoning_boundary_ids = turn_boundary_ids(reasoning_tokenizer)
+
+reasoning_attention_count = resolve_attention_trim(
+    "Reasoning",
+    reasoning_generated_ids,
+    reasoning_boundary_ids,
+    reasoning_degenerate_start,
+    reasoning_degenerate_period,
+)
+
+reasoning_attention_ids = reasoning_generated_ids[:reasoning_attention_count]
 
 if len(reasoning_attention_ids) == 0:
     raise RuntimeError("Reasoning generation collapsed immediately; nothing to average.")
@@ -927,7 +1078,7 @@ reasoning_avg_attention = average_prompt_attention(
     reasoning_attention
 )
 
-print("\nTokens used for attention (after collapse trim):")
+print("\nTokens used for attention (after drift and loop trims):")
 print(f"  IFT       : {len(ift_attention_ids)} / {len(ift_generated_ids)}")
 print(f"  Reasoning : {len(reasoning_attention_ids)} / {len(reasoning_generated_ids)}")
 
@@ -1157,9 +1308,38 @@ reasoning_sink_share, reasoning_sink_mass = sink_profile(reasoning_attn_np)
 
 n_layers, n_heads = ift_sink_share.shape
 
+# The determinism check compares against baselines recorded BEFORE the
+# drift-boundary trim existed, so it recomputes those six values under the old
+# PERIODIC-TAIL-ONLY rule. That is not a fudge: this check's job is to prove
+# generation, attention collection and tail detection are unchanged, and those
+# are exactly the things the tail-only basis measures. The trim POLICY is a
+# downstream choice and is not what this check is testing -- without the split,
+# adding drift detection would read as a regression on every prompt recorded
+# earlier.
+ift_tail_only_ids = (
+    ift_generated_ids
+    if ift_degenerate_start is None
+    else ift_generated_ids[:ift_degenerate_start]
+)
+
+reasoning_tail_only_ids = (
+    reasoning_generated_ids
+    if reasoning_degenerate_start is None
+    else reasoning_generated_ids[:reasoning_degenerate_start]
+)
+
+ift_check_avg = average_prompt_attention(
+    ift_run["attention"][:len(ift_tail_only_ids)]
+)
+reasoning_check_avg = average_prompt_attention(
+    reasoning_run["attention"][:len(reasoning_tail_only_ids)]
+)
+
 print("\n" + "=" * 64)
 print(f"DETERMINISM CHECK -- {test_spec['prompt']}")
 print("=" * 64)
+print("Measured under the periodic-tail rule alone, so the numbers stay")
+print("comparable to baselines recorded before the drift trim was added.")
 
 expected = test_spec.get("expected")
 
@@ -1173,18 +1353,18 @@ if expected is None:
     print("PROMPT_SPECS['expected'] to turn that repetition into a real check.")
 
     print(
-        f"  trim          IFT {len(ift_attention_ids)}/{len(ift_generated_ids)}"
+        f"  trim          IFT {len(ift_tail_only_ids)}/{len(ift_generated_ids)}"
         f" (period {ift_degenerate_period})"
-        f"   Reasoning {len(reasoning_attention_ids)}/{len(reasoning_generated_ids)}"
+        f"   Reasoning {len(reasoning_tail_only_ids)}/{len(reasoning_generated_ids)}"
         f" (period {reasoning_degenerate_period})"
     )
     print(
-        f"  token {SINK_INDEX} attention  IFT {float(ift_avg_attention[SINK_INDEX]):.4f}"
-        f"   Reasoning {float(reasoning_avg_attention[SINK_INDEX]):.6f}"
+        f"  token {SINK_INDEX} attention  IFT {float(ift_check_avg[SINK_INDEX]):.4f}"
+        f"   Reasoning {float(reasoning_check_avg[SINK_INDEX]):.6f}"
     )
     print(
-        f"  prompt mass   IFT {float(ift_avg_attention.sum()):.4f}"
-        f"   Reasoning {float(reasoning_avg_attention.sum()):.4f}"
+        f"  prompt mass   IFT {float(ift_check_avg.sum()):.4f}"
+        f"   Reasoning {float(reasoning_check_avg.sum()):.4f}"
     )
 
 else:
@@ -1192,18 +1372,18 @@ else:
     checks = [
         (
             "IFT trim (n_used, n_generated, period)",
-            (len(ift_attention_ids), len(ift_generated_ids), ift_degenerate_period),
+            (len(ift_tail_only_ids), len(ift_generated_ids), ift_degenerate_period),
             expected["ift_trim"],
         ),
         (
             "Reasoning trim (n_used, n_generated, period)",
-            (len(reasoning_attention_ids), len(reasoning_generated_ids), reasoning_degenerate_period),
+            (len(reasoning_tail_only_ids), len(reasoning_generated_ids), reasoning_degenerate_period),
             expected["reasoning_trim"],
         ),
-        ("IFT token 0 attention", float(ift_avg_attention[SINK_INDEX]), expected["ift_token0"]),
-        ("Reasoning token 0 attention", float(reasoning_avg_attention[SINK_INDEX]), expected["reasoning_token0"]),
-        ("IFT prompt mass", float(ift_avg_attention.sum()), expected["ift_mass"]),
-        ("Reasoning prompt mass", float(reasoning_avg_attention.sum()), expected["reasoning_mass"]),
+        ("IFT token 0 attention", float(ift_check_avg[SINK_INDEX]), expected["ift_token0"]),
+        ("Reasoning token 0 attention", float(reasoning_check_avg[SINK_INDEX]), expected["reasoning_token0"]),
+        ("IFT prompt mass", float(ift_check_avg.sum()), expected["ift_mass"]),
+        ("Reasoning prompt mass", float(reasoning_check_avg.sum()), expected["reasoning_mass"]),
     ]
 
     all_ok = True

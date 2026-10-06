@@ -568,29 +568,58 @@ def sink_profile(attention, sink_index=SINK_INDEX):
     return share, mass
 
 
+def content_mass(attention, sink_index=SINK_INDEX):
+    """Total prompt attention on NON-sink tokens, summed over all heads.
+
+    The sink column is removed before summing, so this is the attention the
+    model spends on prompt tokens that are not the format marker. Dividing it by
+    the raw prompt mass says how much of "attention to the prompt" was the sink.
+    """
+
+    per_head = attention.mean(axis=0).copy()
+
+    per_head[..., sink_index] = 0.0
+
+    return float(per_head.sum())
+
+
 def keep_reader_heads(attention, share, threshold, sink_index=SINK_INDEX):
     """Average prompt attention using only the heads that are not sink-dominant.
 
-    Returns (prompt_vector, retained_share_of_mass, kept, total_heads).
+    Returns (prompt_vector, retained_share_of_content, kept, total_heads).
 
-    retained_share_of_mass is the number to read first. If the readers hold only
-    a percent or two of the total, then the comparison built on them is a
-    comparison of a percent or two of the signal, and should be reported that
-    way rather than as if it were the whole picture.
+    retained_share_of_content is the number to read first: the fraction of all
+    NON-sink prompt attention that the kept heads account for. If the readers
+    hold only a few percent of it, then the comparison built on them is a
+    comparison of a few percent of the signal, and should be reported that way
+    rather than as if it were the whole picture.
 
-    Note the sink is zeroed rather than renormalized away: dropping the sink's
-    mass and rescaling would hide exactly the quantity we are trying to see.
+    The sink COLUMN is zeroed as well as the sink-dominant heads being dropped.
+    Dropping heads alone is not enough: a head kept at a 0.9 threshold may still
+    put most of its mass on the sink, so the surviving total would still be
+    mostly sink and the "sinks removed" label would simply be false. (This was
+    wrong in the first version of this function -- the docstring said the sink
+    was zeroed and the code did not do it, which inflated every mass printed
+    under it. The per-word tables were unaffected, because they slice away the
+    sink token, but the mass numbers were not.)
+
+    Note the surviving mass is reported, never rescaled to 1: rescaling would
+    hide exactly the quantity being measured.
     """
 
     keep = share < threshold
 
-    per_head = attention.mean(axis=0) * keep[..., None]
+    per_head = attention.mean(axis=0).copy()
 
-    prompt_vector = per_head.sum(axis=(0, 1))
+    per_head[..., sink_index] = 0.0
 
-    total = attention.mean(axis=0).sum()
+    total_content = float(per_head.sum())
 
-    retained = float(per_head.sum() / total) if total > 0 else 0.0
+    reader_mass = per_head * keep[..., None]
+
+    prompt_vector = reader_mass.sum(axis=(0, 1))
+
+    retained = float(reader_mass.sum() / total_content) if total_content > 0 else 0.0
 
     return prompt_vector, retained, int(keep.sum()), int(keep.size)
 
@@ -1113,17 +1142,32 @@ print("=" * 64)
 ift_full_mass = float(ift_avg_attention.sum())
 reasoning_full_mass = float(reasoning_avg_attention.sum())
 
+# Content mass = prompt attention with the sink column removed. Everything below
+# is reported as a share of THIS, not of the raw prompt mass, because a share of
+# the raw mass mostly measures the sink.
+ift_content_mass = content_mass(ift_attn_np)
+reasoning_content_mass = content_mass(reasoning_attn_np)
+
+if_to_mean = ift_sink_mass.size
+re_to_mean = reasoning_sink_mass.size
+
 print(
     f"Prompt mass, all heads -- IFT {ift_full_mass:.4f}"
     f"   Reasoning {reasoning_full_mass:.4f}"
 )
 print(
-    f"  of which the sink alone is"
+    f"  the sink alone is"
     f" IFT {float(ift_avg_attention[SINK_INDEX]):.4f}"
     f" ({100 * float(ift_avg_attention[SINK_INDEX]) / ift_full_mass:.1f}%)"
     f"   Reasoning {float(reasoning_avg_attention[SINK_INDEX]):.4f}"
     f" ({100 * float(reasoning_avg_attention[SINK_INDEX]) / reasoning_full_mass:.1f}%)"
 )
+print(
+    f"  non-sink CONTENT mass (the real budget) --"
+    f" IFT {ift_content_mass / if_to_mean:.4f}"
+    f"   Reasoning {reasoning_content_mass / re_to_mean:.4f}"
+)
+print("  (same per-head average scale as the line above, sink column removed)")
 
 # Two thresholds on purpose. A finding that holds at both is robust; a finding
 # that flips between them was a property of the threshold, not of the models.
@@ -1142,17 +1186,28 @@ for threshold in (0.9, 0.5):
 
     print(
         f"  IFT       kept {ift_kept:3d}/{ift_total} heads,"
-        f" holding {100 * ift_retained:6.2f}% of prompt attention"
+        f" holding {100 * ift_retained:6.2f}% of all non-sink content attention"
     )
     print(
         f"  Reasoning kept {reasoning_kept:3d}/{reasoning_total} heads,"
-        f" holding {100 * reasoning_retained:6.2f}% of prompt attention"
+        f" holding {100 * reasoning_retained:6.2f}% of all non-sink content attention"
     )
 
+    # Content mass with the sink column removed, so this number is comparable
+    # across thresholds (unlike the raw prompt mass, which is mostly sink).
+    ift_reader_mass = float(ift_vec.sum()) / ift_total
+    reasoning_reader_mass = float(reasoning_vec.sum()) / reasoning_total
+
     print(
-        f"  prompt mass with sinks dropped -- IFT {ift_vec.sum():.4f}"
-        f"   Reasoning {reasoning_vec.sum():.4f}"
+        f"  content mass on the prompt -- IFT {ift_reader_mass:.5f}"
+        f"   Reasoning {reasoning_reader_mass:.5f}"
     )
+
+    if reasoning_reader_mass > 0:
+        print(
+            f"  IFT / Reasoning = {ift_reader_mass / reasoning_reader_mass:.3f}"
+            "   (1.0 = the two models read the prompt equally)"
+        )
 
     # Same user-prompt window as the table at the top of the file: `start` and
     # `end` are the location of the raw user prompt inside the chat template,

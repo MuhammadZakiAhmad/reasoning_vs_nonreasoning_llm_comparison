@@ -1005,6 +1005,272 @@ def repeated_token_groups(tokens, attention_values):
 
     return {token: occ for token, occ in groups.items() if len(occ) >= 2}
 
+
+# ============================================================
+# STAGE C HELPERS: PROMPT-ATTENTION SHAPE, PHASE-MATCHED
+# ============================================================
+#
+# Every comparison above averages over the WHOLE generation. That is wrong for
+# two models whose generations do different things: the reasoning model spends
+# ~85% of its tokens thinking and the IFT model spends 0% of its tokens thinking,
+# because it has no thinking phase. So "IFT vs Reasoning" was partly comparing
+# answering against deliberating.
+#
+# The reframe: stop comparing how MUCH attention lands on the prompt (that is a
+# length/phase property and it is out of scope now), and compare the SHAPE -- the
+# distribution of attention across the prompt's own words, renormalized to sum to
+# 1. Shape is a within-model, within-prompt quantity, so the two models' unequal
+# generation lengths cancel out of it.
+#
+# Two comparisons, and the second is what makes the first readable:
+#
+#   C1  Reasoning thinking vs Reasoning answering -- SAME model, same prompt,
+#       same weights. Any shape difference here is a pure PHASE effect and
+#       cannot be a model difference. This is the yardstick.
+#   C2  IFT vs Reasoning-answering -- both models writing their answer. Matched
+#       phase at last: IFT's 9 tokens are all answer, Reasoning's post-</think>
+#       tokens are all answer.
+#
+# If C1's distance is small, the phase worry is dead and C2 is a clean model
+# comparison. If C1's distance is large, the phase effect is real and C2 must be
+# read with that number beside it. Either answer is a result.
+
+
+def _as_numpy(attention):
+    """Accept a torch tensor or an ndarray; return a float64 ndarray.
+
+    The cache path yields a torch tensor, the pure-helper path yields numpy, and
+    the unit tests yield numpy. One converter keeps every caller the same.
+    """
+
+    if hasattr(attention, "detach"):
+        attention = attention.detach().cpu()
+
+    return np.asarray(attention, dtype=np.float64)
+
+
+def find_trace_end(generated_ids, tokenizer, end_tags=REASONING_END_TAGS):
+    """Index of the first generated token AFTER the reasoning trace closes.
+
+    Returns None when no closing tag is present in the generation. None means
+    "no answer phase exists to compare", and every caller must SKIP rather than
+    fall back to the whole window -- falling back is how the chickens/cows run
+    graded a marker found inside an unclosed trace.
+
+    Search order, token-identity first and text second:
+
+      1. The tag as an exact ID SEQUENCE, scanned over generated_ids. This is
+         the primary path and it never touches decoded text, so there are no
+         offsets and no whitespace to get wrong.
+
+      2. Only if (1) finds nothing: concatenate the per-token STRINGS from
+         convert_ids_to_tokens and map the tag's end character back to a token
+         index.
+
+    Note what is deliberately NOT used: tokenizer.decode(). Its default is
+    skip_special_tokens=True, which silently DELETES <|im_end|> / <think> and
+    every later offset shifts by the length of what was removed. That is the
+    same class of mistake as the eos_token_id bug -- trusting a default instead
+    of checking it -- and it is why neither path here calls decode().
+    """
+
+    ids = (
+        generated_ids.tolist()
+        if hasattr(generated_ids, "tolist")
+        else list(generated_ids)
+    )
+
+    # 1. Exact id-sequence match.
+    for tag in end_tags:
+
+        tag_ids = tokenizer.encode(tag, add_special_tokens=False)
+
+        if not tag_ids:
+            continue
+
+        n = len(tag_ids)
+
+        for i in range(len(ids) - n + 1):
+
+            if ids[i:i + n] == list(tag_ids):
+                return i + n
+
+    # 2. Per-token string fallback.
+    token_strings = tokenizer.convert_ids_to_tokens(ids)
+
+    joined = ""
+    spans = []
+
+    for index, token_string in enumerate(token_strings):
+        spans.append((len(joined), len(joined) + len(token_string), index))
+        joined += token_string
+
+    for tag in end_tags:
+
+        position = joined.find(tag)
+
+        if position == -1:
+            continue
+
+        tag_end = position + len(tag)
+
+        for _, span_end, index in spans:
+
+            if span_end >= tag_end:
+                return index + 1
+
+    return None
+
+
+def prompt_shape(attention, user_start, user_end, lo=0, hi=None):
+    """Renormalized attention SHAPE over the user-prompt tokens, one phase.
+
+    attention : [generated_tokens, layers, heads, prompt_tokens]
+    lo, hi    : generated-token window, hi exclusive; hi=None means "to the end"
+
+    Returns a 1-D float array of length (user_end - user_start) summing to 1.
+
+    The sink is excluded by construction: user_start/user_end delimit the raw
+    user prompt inside the chat template, and the sink sits at prompt index 0,
+    outside that range. The sink is reported separately elsewhere; it must not
+    be part of a shape, because a shape is a statement about the question's own
+    words.
+
+    The normalization is the whole point: it divides out HOW MUCH attention
+    reached the prompt, leaving only how that attention was spread across the
+    words. Two models with wildly different prompt-attention totals therefore
+    become directly comparable.
+
+    Raises rather than returning zeros: an empty window or an all-zero sum means
+    the caller asked a question with no answer, and a silent nan would propagate
+    into every number below it.
+    """
+
+    attention = _as_numpy(attention)
+
+    if hi is None:
+        hi = attention.shape[0]
+
+    if lo < 0 or hi > attention.shape[0] or hi <= lo:
+        raise ValueError(
+            f"empty or out-of-range phase window [{lo}:{hi}] for a generation "
+            f"of {attention.shape[0]} tokens"
+        )
+
+    # Mean over generated tokens in the window, then over layers and heads.
+    per_prompt_token = attention[lo:hi].mean(axis=(0, 1, 2))
+
+    user = per_prompt_token[user_start:user_end]
+
+    total = float(user.sum())
+
+    if total <= 0:
+        raise ValueError(
+            "attention on the user prompt sums to zero over this window, so no "
+            "shape exists"
+        )
+
+    return user / total
+
+
+def total_variation_distance(a, b):
+    """Half the L1 distance between two distributions.
+
+    0.0 = identical shapes; 1.0 = no overlap at all. Both inputs must already be
+    normalized (prompt_shape does that). Reported instead of a raw mean-|diff|
+    because it has a fixed 0-1 range, so two distances can be compared across
+    different prompts without knowing the token count.
+    """
+
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+
+    if a.shape != b.shape:
+        raise ValueError(f"shape mismatch: {a.shape} vs {b.shape}")
+
+    return float(np.abs(a - b).sum() / 2.0)
+
+
+def verify_phase_cut(
+    tokenizer,
+    generated_ids,
+    cut_index,
+    end_tags=REASONING_END_TAGS,
+    window=4,
+):
+    """Print what a trace-end cut landed on, three ways, before it is trusted.
+
+    Same discipline as verify_drift_cut, which is what exposed the eos bug: one
+    line of decoded output around the boundary killed two sessions of wrong
+    theory. An off-by-one here would reshape the answer phase and quietly change
+    every Stage C number.
+
+    Prints, for the tokens either side of the cut:
+      * the raw ids
+      * the per-token strings via convert_ids_to_tokens (shows <|...|> and the
+        G/C space markers)
+      * decode(..., skip_special_tokens=False) as text
+    and cross-checks the cut against final_answer_region() on the full text, so
+    the token-space boundary and the text-space boundary can be compared
+    directly.
+    """
+
+    ids = (
+        generated_ids.tolist()
+        if hasattr(generated_ids, "tolist")
+        else list(generated_ids)
+    )
+
+    if cut_index is None:
+
+        print("phase cut: NONE -- no trace-closing tag found in the generation.")
+        print(f"  tags searched: {end_tags}")
+        print("  the phase comparison must be skipped, not fall back to all tokens")
+
+        return
+
+    before = max(0, cut_index - window)
+    after = min(len(ids), cut_index + window)
+
+    print(
+        f"phase cut: answering starts at generated token {cut_index} of {len(ids)}"
+    )
+    print(
+        f"  thinking : {cut_index} tokens"
+        f"   answering : {len(ids) - cut_index} tokens"
+    )
+
+    print("  raw ids either side:")
+    print(f"    before: {ids[before:cut_index]}")
+    print(f"    after : {ids[cut_index:after]}")
+
+    print("  per-token strings either side:")
+    print(f"    before: {tokenizer.convert_ids_to_tokens(ids[before:cut_index])}")
+    print(f"    after : {tokenizer.convert_ids_to_tokens(ids[cut_index:after])}")
+
+    print("  text either side (skip_special_tokens=False):")
+    print(
+        f"    before: "
+        f"{tokenizer.decode(ids[before:cut_index], skip_special_tokens=False)!r}"
+    )
+    print(
+        f"    after : "
+        f"{tokenizer.decode(ids[cut_index:after], skip_special_tokens=False)!r}"
+    )
+
+    full_text = tokenizer.decode(ids, skip_special_tokens=False)
+    region = final_answer_region(full_text)
+
+    print("  text-space cross-check (final_answer_region):")
+
+    if region is None:
+        print("    NONE -- the tag was found in id/string space but NOT in the")
+        print("    decoded text. Do NOT trust this cut; report it before reading")
+        print("    any Stage C number.")
+    else:
+        print(f"    region starts: {region[:60]!r}")
+
+
 test_prompt = prompts[TEST_PROMPT_INDEX]
 test_spec = PROMPT_SPECS[TEST_PROMPT_INDEX]
 
@@ -1870,4 +2136,186 @@ print("    explains the table, and the IFT/Reasoning split is a recency effect")
 print("    rather than attention to content.")
 print("  * B3 breaks ties: identical tokens, so any spread there is positional by")
 print("    construction -- except for the sink, which is flagged.")
+
+
+# ============================================================
+# STAGE C: PROMPT-ATTENTION SHAPE, PHASE-MATCHED
+# ============================================================
+#
+# Everything above compares HOW MUCH attention each model puts on the prompt, or
+# averages over the whole generation. Both are contaminated by the fact that the
+# two models' generations do different jobs: the reasoning model deliberates
+# first, the IFT model does not deliberate at all.
+#
+# Stage C drops the "how much" question entirely and asks only about SHAPE -- the
+# distribution of attention across the prompt's own words, renormalized to sum to
+# 1. Because it is renormalized, unequal prompt-attention totals cancel out, and
+# because it is sliced to a single phase, unequal generation lengths cancel too.
+#
+#   C1  Reasoning thinking vs Reasoning answering  -> the PHASE yardstick.
+#       Same model, so any difference here cannot be a model difference.
+#   C2  IFT vs Reasoning answering                 -> the real comparison,
+#       both models writing their answer.
+#
+# Nothing below runs unless the trace-end cut is confirmed by verify_phase_cut.
+
+print("\n" + "=" * 64)
+print("STAGE C: PROMPT-ATTENTION SHAPE, PHASE-MATCHED")
+print("=" * 64)
+
+print(f"Prompt: {test_prompt}")
+print(f"User prompt tokens: {user_tokens}")
+print(
+    f"User prompt = full-sequence tokens {start}..{end - 1}"
+    " (the sink at index 0 is outside this range, so it is never part of a shape)"
+)
+
+# ------------------------------------------------------------
+# Where the reasoning trace closes, verified before it is used
+# ------------------------------------------------------------
+
+reasoning_cut = find_trace_end(reasoning_generated_ids, reasoning_tokenizer)
+
+verify_phase_cut(reasoning_tokenizer, reasoning_generated_ids, reasoning_cut)
+
+reasoning_full = _as_numpy(reasoning_run["attention"])
+ift_full = _as_numpy(ift_run["attention"])
+
+# The generation end, after the loop/drift trim. Post-eos this equals the full
+# generation; printed either way so a trim that actually removed something is
+# visible rather than assumed away.
+reasoning_end = len(reasoning_attention_ids)
+ift_end = len(ift_attention_ids)
+
+print(
+    f"\nWindows available --"
+    f"  IFT {ift_end}/{ift_full.shape[0]} tokens"
+    f"   Reasoning {reasoning_end}/{reasoning_full.shape[0]} tokens"
+    f" (post-trim / generated)"
+)
+
+stage_c_ok = True
+
+if reasoning_cut is None:
+
+    stage_c_ok = False
+
+    print("\nSKIPPED: no trace-closing tag in the reasoning generation, so its")
+    print("answer phase cannot be located and C1/C2 would not be comparing what")
+    print("they claim to. Nothing below is printed rather than printing numbers")
+    print("under a label that is false.")
+
+else:
+
+    think_tokens = reasoning_cut
+    answer_tokens = reasoning_end - reasoning_cut
+
+    if think_tokens < 1 or answer_tokens < 1:
+        stage_c_ok = False
+        print(
+            f"\nSKIPPED: the cut leaves an empty phase --"
+            f" thinking {think_tokens}, answering {answer_tokens}."
+        )
+
+    if reasoning_end > reasoning_full.shape[0] or ift_end > ift_full.shape[0]:
+        stage_c_ok = False
+        print("\nSKIPPED: a window is longer than the tensor it slices.")
+
+if stage_c_ok:
+
+    ift_shape = prompt_shape(ift_full, start, end, lo=0, hi=ift_end)
+
+    reasoning_think_shape = prompt_shape(
+        reasoning_full, start, end, lo=0, hi=reasoning_cut
+    )
+
+    reasoning_answer_shape = prompt_shape(
+        reasoning_full, start, end, lo=reasoning_cut, hi=reasoning_end
+    )
+
+    # Structural invariants. A shape that does not sum to 1, or phases that do
+    # not add up to the generation, means the slicing is wrong -- so these are
+    # checked before any distance is quoted.
+    for label, shape in (
+        ("IFT", ift_shape),
+        ("Reasoning-think", reasoning_think_shape),
+        ("Reasoning-answer", reasoning_answer_shape),
+    ):
+        total = float(np.abs(shape).sum())
+
+        print(
+            f"  {label:16s} sum of |weights| = {total:.6f}"
+            f"   ({'ok' if abs(total - 1.0) < 1e-6 else 'BAD -- not normalized'})"
+        )
+
+    tv_phase = total_variation_distance(reasoning_think_shape, reasoning_answer_shape)
+    tv_models = total_variation_distance(ift_shape, reasoning_answer_shape)
+
+    print("\n" + "-" * 64)
+    print("C1. THE PHASE YARDSTICK -- same model, thinking vs answering")
+    print("-" * 64)
+    print(
+        f"Reasoning thinking : tokens 0..{reasoning_cut - 1}"
+        f" ({think_tokens} tokens)"
+    )
+    print(
+        f"Reasoning answering: tokens {reasoning_cut}..{reasoning_end - 1}"
+        f" ({answer_tokens} tokens)"
+    )
+
+    display(pd.DataFrame({
+        "token": user_tokens,
+        "Reasoning_thinking": reasoning_think_shape,
+        "Reasoning_answering": reasoning_answer_shape,
+        "answering_minus_thinking": reasoning_answer_shape - reasoning_think_shape,
+    }))
+
+    print(
+        f"\n  TOTAL VARIATION DISTANCE (thinking vs answering): {tv_phase:.4f}"
+    )
+    print("  0.00 = thinking and answering look at the prompt identically")
+    print("  1.00 = they have nothing in common")
+    print("  THIS IS THE NUMBER THAT DECIDES WHETHER C2 CAN BE TRUSTED.")
+
+    print("\n" + "-" * 64)
+    print("C2. THE COMPARISON -- IFT vs Reasoning, both answering")
+    print("-" * 64)
+    print(f"IFT window       : tokens 0..{ift_end - 1} ({ift_end} tokens)")
+    print(
+        f"Reasoning window : tokens {reasoning_cut}..{reasoning_end - 1}"
+        f" ({answer_tokens} tokens), after its trace closed"
+    )
+
+    display(pd.DataFrame({
+        "token": user_tokens,
+        "IFT_attention": ift_shape,
+        "Reasoning_answering": reasoning_answer_shape,
+        "Reasoning_minus_IFT": reasoning_answer_shape - ift_shape,
+    }))
+
+    print(
+        f"\n  TOTAL VARIATION DISTANCE (IFT vs Reasoning, both answering):"
+        f" {tv_models:.4f}"
+    )
+
+    print("\n" + "=" * 64)
+    print("HOW TO READ STAGE C")
+    print("=" * 64)
+    print("  * Compare C1's distance to C2's before believing C2.")
+    print("  * C1 large (say, well above ~0.3): a model's shape depends heavily on")
+    print("    whether it is thinking or answering. C2 is then only meaningful as a")
+    print("    phase-matched comparison, and prompt-attention mass is off the table.")
+    print("  * C1 small: the phase effect is minor, and C2's gap is closer to a real")
+    print("    model difference.")
+    print("  * IFT's window is ~a few tokens. A shape from that few samples is")
+    print("    noisy -- read the table, not just the distance.")
+
+    print(
+        f"\nHEADLINE NUMBERS -- phase yardstick (C1, same model): {tv_phase:.4f}"
+        f"   model comparison (C2, matched phase): {tv_models:.4f}"
+    )
+
+else:
+
+    print("\nStage C produced no numbers. See the SKIPPED reason above.")
 

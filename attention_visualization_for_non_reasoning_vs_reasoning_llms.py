@@ -19,6 +19,7 @@ Original notebook:
 """
 
 import hashlib
+import io
 import os
 import sys
 import tempfile
@@ -34,7 +35,10 @@ import torch
 
 # display() renders objects into the Colab output. Imported explicitly rather
 # than relying on it being pre-injected into the kernel namespace.
-from IPython.display import display
+#
+# Image is here because figures are displayed as encoded PNGs, not as Figure
+# objects -- see show_figure() for why.
+from IPython.display import Image, display
 
 from models import get_model
 
@@ -172,6 +176,79 @@ PROMPT_SPECS = [
         # are in git history at the commit before the fix. The next run prints
         # fresh values to record.
     },
+
+    # ----------------------------------------------------------------
+    # Prompts 6-12 (below): one per KIND, for the Stage C cross-type run.
+    #
+    # Why these exist: index 5 is a factual lookup with a single retrievable
+    # answer, so both models converge and there is little for them to differ
+    # about. If the two models' attention SHAPES diverge anywhere, it should be
+    # on a prompt with no single retrievable answer, where the reasoning model's
+    # deliberation is doing real work.
+    #
+    # A `kind` label is what opts a spec into the cross-type loop at the end of
+    # this file -- there is no second list to keep in sync.
+    #
+    # `ungraded` marks an open-ended prompt: there is no marker string that can
+    # be "right", and an empty `must_contain` would otherwise read as a vacuous
+    # CORRECT. See check_answer().
+    # ----------------------------------------------------------------
+
+    {
+        "kind": "opinion",
+        "prompt": "Is it better to study in the morning or at night? Give your opinion.",
+        "ground_truth": None,
+        "must_contain": [],
+        "ungraded": True,
+    },
+    {
+        "kind": "explain-why",
+        "prompt": "Explain why the sky looks blue during the day.",
+        "ground_truth": "Short (blue) wavelengths scatter more than long (red) ones",
+        "must_contain": ["scatter", "blue"],
+    },
+    {
+        "kind": "counterfactual",
+        "prompt": "What would happen to the oceans if the Moon suddenly disappeared?",
+        "ground_truth": "Tides would shrink to the small solar-driven component",
+        "must_contain": ["tide"],
+    },
+    {
+        "kind": "ambiguous",
+        # The interesting question here is not which name it picks but whether
+        # it picks one confidently or hedges -- so it is deliberately ungraded.
+        "prompt": "Who was the greatest scientist of all time?",
+        "ground_truth": None,
+        "must_contain": [],
+        "ungraded": True,
+    },
+    {
+        "kind": "creative",
+        # Highest degeneration risk in the set: "produce a list" is the classic
+        # way a 1.5B model starts looping. The per-prompt status line reports it.
+        "prompt": "Give five names for a small coffee shop.",
+        "ground_truth": None,
+        "must_contain": [],
+        "ungraded": True,
+    },
+    {
+        "kind": "math",
+        # Deliberately a division, not a multiplication. The intuitive move is
+        # 25 * 1.2 = 30, which is wrong; the right move is 25 / 0.8 = 31.25. A
+        # model that does not deliberate tends to take the intuitive move, so
+        # this separates the two models by ANSWER as well as by attention.
+        "prompt": "If a jacket costs $25 after a 20% discount, what was its original price?",
+        "ground_truth": "31.25",
+        "must_contain": ["31.25"],
+    },
+    {
+        "kind": "math-trap",
+        "prompt": "A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. How much does the ball cost?",
+        "ground_truth": "0.05",
+        "must_contain": ["0.05"],
+        # The famous intuitive-but-wrong answer is 0.10. Correct phrasings the
+        # crude marker MISSES: "5 cents", "five cents" -- read the response.
+    },
 ]
 
 prompts = [spec["prompt"] for spec in PROMPT_SPECS]
@@ -226,6 +303,18 @@ def check_answer(response_text, spec, scope="full"):
             "misses": list(spec["must_contain"]),
             "positions": {},
             "scope_chars": 0,
+        }
+
+    if spec.get("ungraded"):
+        # An open-ended prompt has no marker that can be "right", so an empty
+        # must_contain would fall through to `not misses` and report a vacuous
+        # CORRECT -- a verdict with no basis. Say so instead.
+        return {
+            "verdict": "UNGRADED (open-ended -- read the response)",
+            "hits": [],
+            "misses": [],
+            "positions": {},
+            "scope_chars": len(region),
         }
 
     text = region.lower()
@@ -445,12 +534,18 @@ def resolve_attention_trim(
     boundary_ids,
     degenerate_start,
     degenerate_period,
+    quiet=False,
 ):
     """How many leading generated tokens the average may use, and why.
 
     One place decides the trim for both models, so the two cannot silently
     drift apart -- which is how the sink-column bug survived review earlier.
     Returns the count; the caller slices.
+
+    quiet=True suppresses the per-model block and returns the count alone. The
+    cross-type loop calls this once per model per prompt, where that block would
+    be ~6 lines x 14 runs; it prints _guard_status() instead, built from the
+    same two detectors so the compact line cannot disagree with the trim.
     """
 
     drift_start = find_drift_start(generated_ids, boundary_ids)
@@ -458,6 +553,9 @@ def resolve_attention_trim(
 
     n_generated = len(generated_ids)
     n_used = n_generated if trim_start is None else trim_start
+
+    if quiet:
+        return n_used
 
     print(f"\n{label} attention window:")
 
@@ -1049,7 +1147,7 @@ def _as_numpy(attention):
     return np.asarray(attention, dtype=np.float64)
 
 
-def find_trace_end(generated_ids, tokenizer, end_tags=REASONING_END_TAGS):
+def find_trace_end(generated_ids, tokenizer, end_tags=REASONING_END_TAGS, report=None):
     """Index of the first generated token AFTER the reasoning trace closes.
 
     Returns None when no closing tag is present in the generation. None means
@@ -1066,6 +1164,12 @@ def find_trace_end(generated_ids, tokenizer, end_tags=REASONING_END_TAGS):
       2. Only if (1) finds nothing: concatenate the per-token STRINGS from
          convert_ids_to_tokens and map the tag's end character back to a token
          index.
+
+    `report`, when a list is passed, gets the name of the path that fired
+    appended to it ("id-sequence" / "token-strings"). Which path found the
+    boundary was invisible in S4 -- the cut was provably right, but which code
+    produced it could not be read off the output. A list rather than a changed
+    return type, so every existing caller keeps its plain int-or-None.
 
     Note what is deliberately NOT used: tokenizer.decode(). Its default is
     skip_special_tokens=True, which silently DELETES <|im_end|> / <think> and
@@ -1093,6 +1197,8 @@ def find_trace_end(generated_ids, tokenizer, end_tags=REASONING_END_TAGS):
         for i in range(len(ids) - n + 1):
 
             if ids[i:i + n] == list(tag_ids):
+                if report is not None:
+                    report.append("id-sequence")
                 return i + n
 
     # 2. Per-token string fallback.
@@ -1117,7 +1223,12 @@ def find_trace_end(generated_ids, tokenizer, end_tags=REASONING_END_TAGS):
         for _, span_end, index in spans:
 
             if span_end >= tag_end:
+                if report is not None:
+                    report.append("token-strings")
                 return index + 1
+
+    if report is not None:
+        report.append("not-found")
 
     return None
 
@@ -1197,6 +1308,7 @@ def verify_phase_cut(
     cut_index,
     end_tags=REASONING_END_TAGS,
     window=4,
+    quiet=False,
 ):
     """Print what a trace-end cut landed on, three ways, before it is trusted.
 
@@ -1213,6 +1325,11 @@ def verify_phase_cut(
     and cross-checks the cut against final_answer_region() on the full text, so
     the token-space boundary and the text-space boundary can be compared
     directly.
+
+    quiet=True keeps the audit but drops it to one line -- the decoded text
+    either side. The cross-type loop calls this 7 times, where the full block
+    would be ~12 lines each, and the text either side is the part that has
+    actually ever caught anything.
     """
 
     ids = (
@@ -1231,6 +1348,22 @@ def verify_phase_cut(
 
     before = max(0, cut_index - window)
     after = min(len(ids), cut_index + window)
+
+    if quiet:
+
+        before_text = tokenizer.decode(
+            ids[max(0, cut_index - 2):cut_index], skip_special_tokens=False
+        )
+        after_text = tokenizer.decode(
+            ids[cut_index:min(len(ids), cut_index + 2)], skip_special_tokens=False
+        )
+
+        print(
+            f"  cut @{cut_index} of {len(ids)}:"
+            f" {before_text!r} -> {after_text!r}"
+        )
+
+        return
 
     print(
         f"phase cut: answering starts at generated token {cut_index} of {len(ids)}"
@@ -1269,6 +1402,208 @@ def verify_phase_cut(
         print("    any Stage C number.")
     else:
         print(f"    region starts: {region[:60]!r}")
+
+
+def locate_user_prompt(tokenizer, prompt):
+    """(start, end, labels) for the raw prompt inside its chat template.
+
+    The chat template wraps the prompt in control tokens, so the prompt's own
+    tokens sit at an offset that depends on the prompt. Matching the raw
+    tokenization as a substring of the templated ids is how that offset is found
+    WITHOUT hardcoding a range -- a hardcoded range breaks silently on the next
+    prompt, which is exactly the trap the S4 run's "24..31" would have set.
+
+    Returns the half-open [start, end) range in FULL-sequence coordinates, and
+    the per-token labels for the plot's y-axis.
+
+    Raises when the raw tokenization does not appear in the template, rather than
+    returning a wrong range: a wrong range produces a shape over the wrong tokens
+    and every number downstream would be mislabelled but plausible.
+    """
+
+    user_ids = tokenizer.encode(prompt, add_special_tokens=False)
+
+    messages = [{"role": "user", "content": prompt}]
+
+    full_ids = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+    )["input_ids"][0]
+
+    n = len(user_ids)
+    needle = torch.tensor(user_ids)
+
+    start = None
+
+    for i in range(len(full_ids) - n + 1):
+
+        if torch.equal(full_ids[i:i + n], needle):
+            start = i
+            break
+
+    if start is None:
+        raise ValueError(
+            "the prompt's own tokenization does not appear inside its chat "
+            f"template, so its token range cannot be located: {prompt!r}"
+        )
+
+    labels = [tokenizer.decode([token_id]) for token_id in user_ids]
+
+    return start, start + n, labels
+
+
+def per_word_diff(a, b):
+    """Per-word difference b - a, in the same normalized units as the shapes.
+
+    Kept separate from the plot because this is where a bug would hide: the SIGN
+    is what the chart reads, so the sign is what gets unit-tested. A chart drawn
+    from a sign-flipped diff looks entirely plausible.
+    """
+
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+
+    if a.shape != b.shape:
+        raise ValueError(f"shape mismatch: {a.shape} vs {b.shape}")
+
+    return b - a
+
+
+def plot_shape_diff(labels, diff, title, up_label, down_label):
+    """Diverging horizontal bars: where `b` puts more (or less) weight than `a`.
+
+    Bars right of zero are words `b` weights more than `a`; bars left are words
+    `a` weights more. Values are PERCENTAGE POINTS, and the bars' absolute values
+    sum to 2 x the total-variation distance, so the chart and the TV number agree
+    by construction.
+
+    Returns the figure; the caller displays it. Nothing is saved to disk -- the
+    figures are for reading in the notebook.
+
+    Read the SHAPE of the bars, not the level: a long bar means the two windows
+    disagree about that word. A word both windows ignore gives a short bar, and a
+    word both windows care about equally also gives a short bar -- this view
+    cannot tell those apart. The paired table printed above the chart can.
+    """
+
+    points = np.asarray(diff, dtype=np.float64) * 100.0
+
+    y = np.arange(len(labels))
+
+    fig, ax = plt.subplots(figsize=(9.5, 0.42 * len(labels) + 2.1))
+
+    colors = ["#c0392b" if value >= 0 else "#1f618d" for value in points]
+
+    ax.barh(y, points, color=colors, height=0.68)
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels)
+    ax.invert_yaxis()
+    ax.axvline(0.0, color="black", linewidth=1.0)
+
+    span = max(float(np.abs(points).max()), 1.0)
+    offset = span * 0.025
+
+    for yi, value in zip(y, points):
+
+        if value >= 0:
+            ax.text(
+                value + offset, yi, f"{value:+.1f}",
+                va="center", ha="left", fontsize=9,
+            )
+        else:
+            ax.text(
+                value - offset, yi, f"{value:+.1f}",
+                va="center", ha="right", fontsize=9,
+            )
+
+    ax.set_xlim(-span * 1.3, span * 1.3)
+    ax.set_xlabel("percentage points of prompt attention")
+    ax.set_title(
+        f"{title}\nright = {up_label}   |   left = {down_label}",
+        fontsize=10,
+    )
+    ax.grid(axis="x", alpha=0.25)
+    ax.set_axisbelow(True)
+
+    fig.tight_layout()
+
+    return fig
+
+
+def _guard_status(label, generated_ids, boundary_ids, trim_start, trim_period):
+    """One line describing how a generation ended: stop, drift, loop, cap.
+
+    Built from the SAME two detectors resolve_attention_trim() uses, so this
+    compact line cannot disagree with the trim it summarises.
+
+    Exists because the run spans many prompts: the six-line per-model block is
+    right for one prompt and unreadable for fourteen. The line keeps the
+    guards visible -- a prompt that degenerated, or one that hit the cap, is
+    reported rather than buried.
+    """
+
+    n = len(generated_ids)
+    drift = find_drift_start(generated_ids, boundary_ids)
+
+    if drift is None:
+        stop = "no-stop (mid-reply)"
+    elif drift == n - 1:
+        stop = "clean-stop"
+    else:
+        stop = f"DRIFT@{drift}"
+
+    if trim_start is None:
+        loop = "none"
+    else:
+        loop = f"LOOP@{trim_start}/period {trim_period}"
+
+    cap = "CAP-HIT" if n >= MAX_NEW_TOKENS else "under-cap"
+
+    return f"{label:10s} {n:5d} tok | {stop:16s} | loop: {loop:22s} | {cap}"
+
+
+def render_figure_png(fig, dpi=130):
+    """PNG bytes for a figure.
+
+    Split out from show_figure() so the bytes themselves are testable -- a
+    display path that silently produces an empty image is exactly the S1 failure
+    ("the chart has never been seen"), and this is the part that can be checked
+    without a browser.
+    """
+
+    buffer = io.BytesIO()
+
+    fig.savefig(buffer, format="png", dpi=dpi, bbox_inches="tight")
+
+    data = buffer.getvalue()
+
+    buffer.close()
+
+    return data
+
+
+def show_figure(fig, dpi=130):
+    """Display a figure as an explicit PNG, and free it.
+
+    Deliberately NOT `display(fig)`. That relies on IPython having attached a
+    `_repr_png_` to the Figure object, which happens inside a kernel's inline
+    setup -- and which could not be confirmed to fire here at all, in or out of a
+    kernel. A display call that silently renders nothing is worse than one that
+    errors, because the run looks successful.
+
+    Encoding the PNG ourselves is explicit, so the image either appears or the
+    failure is visible at the line that caused it.
+
+    Nothing is written to disk; the buffer is discarded after display.
+    """
+
+    display(Image(data=render_figure_png(fig, dpi=dpi)))
+
+    plt.close(fig)
 
 
 test_prompt = prompts[TEST_PROMPT_INDEX]
@@ -2318,4 +2653,277 @@ if stage_c_ok:
 else:
 
     print("\nStage C produced no numbers. See the SKIPPED reason above.")
+
+
+# ============================================================
+# STAGE C ACROSS PROMPT TYPES
+# ============================================================
+#
+# Everything above analyses TEST_PROMPT_INDEX alone. That answers "what happens
+# on this one question" and cannot answer the question the reframe exists for:
+# does the IFT-vs-Reasoning shape gap depend on the KIND of question?
+#
+# Index 5 is a factual lookup with a single retrievable answer, so both models
+# converge and there is little for them to differ about. A prompt with no
+# retrievable answer is where a real difference would show -- and a math or logic
+# prompt with a trap answer is where deliberation demonstrably does work.
+#
+# This block runs the same Stage C measurement over every spec carrying a `kind`
+# label and prints, per prompt: a status line, the window sizes, C1 and C2, the
+# paired per-word table, and TWO diverging-bar figures --
+#
+#   C2  Reasoning answering vs IFT answering    (the model comparison)
+#   C1  Reasoning answering vs Reasoning thinking (the phase yardstick)
+#
+# The loop is DERIVED from PROMPT_SPECS, not a second hand-kept list. Adding a
+# spec with a `kind` is all it takes to include it; two parallel lists that must
+# be edited in lockstep is how TEST_PROMPT_INDEX already drifted once.
+
+NEW_PROMPT_INDICES = [
+    index for index, spec in enumerate(PROMPT_SPECS) if spec.get("kind")
+]
+
+print("\n" + "=" * 64)
+print("STAGE C ACROSS PROMPT TYPES")
+print("=" * 64)
+print(
+    f"{len(NEW_PROMPT_INDICES)} prompts carry a `kind` label: "
+    + ", ".join(f"{i}:{PROMPT_SPECS[i]['kind']}" for i in NEW_PROMPT_INDICES)
+)
+
+
+def stage_c_for_prompt(index):
+    """C1, C2, both tables and both figures for one prompt.
+
+    Returns a row dict, or None when the prompt is not comparable (no
+    trace-closing tag, an empty phase, or a shape that is not normalized).
+
+    A skipped prompt is NOT plotted and NOT given numbers: a chart drawn from a
+    phase that was never located carries the same false label as a number would.
+    """
+
+    spec = PROMPT_SPECS[index]
+    prompt = spec["prompt"]
+    kind = spec["kind"]
+
+    print("\n" + "#" * 64)
+    print(f"# PROMPT {index} -- kind: {kind}")
+    print("#" * 64)
+    print(prompt)
+
+    ift_run = run_and_cache("ift", ift_model, ift_tokenizer, prompt)
+    reasoning_run = run_and_cache(
+        "reasoning", reasoning_model, reasoning_tokenizer, prompt
+    )
+
+    ift_generated = ift_run["generated_ids"]
+    reasoning_generated = reasoning_run["generated_ids"]
+
+    ift_boundary_ids = turn_boundary_ids(ift_tokenizer)
+    reasoning_boundary_ids = turn_boundary_ids(reasoning_tokenizer)
+
+    # quiet=True: one status line replaces the per-model block. The trim itself
+    # still comes from the single shared function, so the two models cannot
+    # drift apart on how they were cut.
+    ift_end = resolve_attention_trim(
+        "IFT",
+        ift_generated,
+        ift_boundary_ids,
+        ift_run["trim_start"],
+        ift_run["trim_period"],
+        quiet=True,
+    )
+    reasoning_end = resolve_attention_trim(
+        "Reasoning",
+        reasoning_generated,
+        reasoning_boundary_ids,
+        reasoning_run["trim_start"],
+        reasoning_run["trim_period"],
+        quiet=True,
+    )
+
+    # The loop/stop guards, one line each. A prompt that degenerated or hit the
+    # cap says so here rather than in a wall of text nobody reads.
+    print("  " + _guard_status(
+        "IFT", ift_generated, ift_boundary_ids,
+        ift_run["trim_start"], ift_run["trim_period"],
+    ))
+    print("  " + _guard_status(
+        "Reasoning", reasoning_generated, reasoning_boundary_ids,
+        reasoning_run["trim_start"], reasoning_run["trim_period"],
+    ))
+
+    start, end, labels = locate_user_prompt(ift_tokenizer, prompt)
+
+    path = []
+    reasoning_cut = find_trace_end(
+        reasoning_generated, reasoning_tokenizer, report=path
+    )
+
+    # quiet=True keeps the audit as one line: the decoded text either side of the
+    # cut is the part of the full block that has actually ever caught anything.
+    verify_phase_cut(
+        reasoning_tokenizer, reasoning_generated, reasoning_cut, quiet=True
+    )
+
+    if path:
+        # Which search path found the boundary was an open question after S4 --
+        # the cut was provably right, but which code produced it was invisible.
+        print(f"  trace-end found by: {path[0]}")
+
+    if reasoning_cut is None:
+        print("  SKIPPED: no trace-closing tag, so there is no answering phase")
+        print("  to compare against -- and a fallback to the whole generation")
+        print("  would be labelled 'matched phase' while not being matched.")
+        return None
+
+    think_tokens = reasoning_cut
+    answer_tokens = reasoning_end - reasoning_cut
+
+    if think_tokens < 1 or answer_tokens < 1:
+        print(
+            f"  SKIPPED: the cut leaves an empty phase --"
+            f" thinking {think_tokens}, answering {answer_tokens}."
+        )
+        return None
+
+    ift_full = _as_numpy(ift_run["attention"])
+    reasoning_full = _as_numpy(reasoning_run["attention"])
+
+    if ift_end > ift_full.shape[0] or reasoning_end > reasoning_full.shape[0]:
+        print("  SKIPPED: a window is longer than the tensor it slices.")
+        return None
+
+    ift_shape = prompt_shape(ift_full, start, end, lo=0, hi=ift_end)
+    think_shape = prompt_shape(reasoning_full, start, end, lo=0, hi=reasoning_cut)
+    answer_shape = prompt_shape(
+        reasoning_full, start, end, lo=reasoning_cut, hi=reasoning_end
+    )
+
+    # Checked before any distance is quoted: a shape that does not sum to 1 means
+    # the slicing is wrong, and a wrong slice produces plausible-looking numbers.
+    for label, shape in (
+        ("IFT", ift_shape),
+        ("Reasoning-think", think_shape),
+        ("Reasoning-answer", answer_shape),
+    ):
+        total = float(np.abs(shape).sum())
+
+        if abs(total - 1.0) >= 1e-6:
+            print(f"  SKIPPED: {label} shape sums to {total:.6f}, not 1.")
+            return None
+
+    c2 = total_variation_distance(ift_shape, answer_shape)
+    c1 = total_variation_distance(think_shape, answer_shape)
+
+    # Computed once and shared by the table and the chart, so the printed
+    # numbers and the bars cannot disagree through a repeated call.
+    c2_diff = per_word_diff(ift_shape, answer_shape)
+    c1_diff = per_word_diff(think_shape, answer_shape)
+
+    print(
+        f"  windows: IFT {ift_end} tok (answering) |"
+        f" Reasoning {think_tokens} thinking + {answer_tokens} answering"
+    )
+    print(f"  C1 (same model, thinking vs answering) = {c1:.4f}")
+    print(f"  C2 (IFT vs Reasoning, both answering)  = {c2:.4f}")
+
+    display(pd.DataFrame({
+        "token": labels,
+        "IFT_answering": ift_shape,
+        "Reasoning_answering": answer_shape,
+        "C2_answer_minus_IFT": c2_diff,
+    }))
+
+    fig_c2 = plot_shape_diff(
+        labels,
+        c2_diff,
+        f"[{index}] {kind} -- C2: Reasoning answering vs IFT answering"
+        f"  (TV {c2:.4f})",
+        "Reasoning weights it more",
+        "IFT weights it more",
+    )
+    show_figure(fig_c2)
+
+    fig_c1 = plot_shape_diff(
+        labels,
+        c1_diff,
+        f"[{index}] {kind} -- C1: answering vs thinking, same model"
+        f"  (TV {c1:.4f})",
+        "answering weights it more",
+        "thinking weights it more",
+    )
+    show_figure(fig_c1)
+
+    return {
+        "prompt": index,
+        "kind": kind,
+        "C1_phase": round(c1, 4),
+        "C2_models": round(c2, 4),
+        "C1_larger": "yes" if c1 > c2 else "no",
+        "IFT_tok": int(ift_end),
+        "think_tok": int(think_tokens),
+        "answer_tok": int(answer_tokens),
+    }
+
+
+stage_c_rows = []
+
+for index in NEW_PROMPT_INDICES:
+
+    # ValueError ONLY, and deliberately not a broader except.
+    #
+    # locate_user_prompt(), prompt_shape() and per_word_diff() all raise
+    # ValueError ON PURPOSE for conditions that belong to a single prompt -- a
+    # prompt whose tokenization does not survive templating, a window that is
+    # empty, a shape that is all zeros. Without this, one such prompt aborts the
+    # whole sweep and every prompt after it is lost, which is the same shape of
+    # failure as the S1 broad `except Exception` that hid a NameError for a
+    # whole run. ValueError is a type those functions choose; a NameError or a
+    # TypeError from a typo would still come through and be seen.
+    try:
+
+        row = stage_c_for_prompt(index)
+
+    except ValueError as exc:
+
+        print(f"\n  SKIPPED prompt {index}: {type(exc).__name__}: {exc}")
+        print("  (a condition of this prompt, not of the run -- later prompts")
+        print("  are unaffected)")
+
+        row = None
+
+    if row is not None:
+        stage_c_rows.append(row)
+
+
+print("\n" + "=" * 64)
+print("C1 / C2 ACROSS PROMPT TYPES")
+print("=" * 64)
+
+if stage_c_rows:
+
+    display(pd.DataFrame(stage_c_rows).set_index("prompt"))
+
+    print("\nC1 = same model, thinking vs answering -- the phase yardstick.")
+    print("C2 = IFT vs Reasoning, both answering -- the model comparison.")
+    print("Read C2 only against its own row's C1: if C2 is not clearly smaller")
+    print("than C1, the model gap is not separable from the phase effect.")
+
+else:
+
+    print("No prompt produced a comparable pair. Every prompt skipped; each")
+    print("SKIPPED line above names its own reason.")
+
+skipped = [
+    index for index in NEW_PROMPT_INDICES
+    if not any(row["prompt"] == index for row in stage_c_rows)
+]
+
+if skipped:
+    print(
+        "\nNOTE: prompt(s) " + ", ".join(str(i) for i in skipped)
+        + " produced no number. Reported rather than hidden -- a skip is a"
+        " result about that prompt, not a failure of the run."
+    )
 

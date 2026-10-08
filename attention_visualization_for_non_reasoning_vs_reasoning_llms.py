@@ -695,10 +695,13 @@ def generate_response(model, tokenizer, prompt):
 
     if generated_ids.shape[0] >= MAX_NEW_TOKENS:
         print(
-            f"NOTE: generation reached the {MAX_NEW_TOKENS}-token cap. That means "
-            "EITHER the answer is truncated OR the model finished and then fell "
-            "into a repetition loop. find_degenerate_tail() below separates the "
-            "two; read the response to confirm which."
+            f"NOTE: generation reached the {MAX_NEW_TOKENS}-token cap, so the "
+            "reply may be TRUNCATED rather than finished -- and on non-factual "
+            "prompts the reasoning model does run past 1024 while still inside "
+            "its trace. The status line reports whether a loop fired, but a "
+            "model can wander or self-repeat inside <think> without ever "
+            "becoming periodic, and no detector here would see that. Read the "
+            "generation summary printed with each prompt."
         )
 
     return (
@@ -1604,6 +1607,41 @@ def show_figure(fig, dpi=130):
     display(Image(data=render_figure_png(fig, dpi=dpi)))
 
     plt.close(fig)
+
+
+def generation_summary(text, tail=700):
+    """Two lines describing a generation: its shape, then its end.
+
+    Returns a LIST of lines, so the caller indents them without the helper
+    having to know about prefixes.
+
+    Why this and not the whole text: on non-factual prompts the reasoning model
+    runs to the 1024 cap with its trace still open, and the two things that need
+    reading are (a) whether the trace opened and closed at all, and (b) what the
+    model was doing when generation stopped. Printing several thousand
+    characters per prompt would put the report back to being the wall of text
+    the plots exist to replace.
+
+    `</think>` is ordinary tokens here, not a special token, so a plain
+    skip_special_tokens=True decode keeps it. Only <|im_end|> / <|endoftext|>
+    are dropped -- which is why `<|im_end|>` never appears in the text.
+    """
+
+    text = "" if text is None else text
+
+    opened = "<think>" in text
+    closed = "</think>" in text
+
+    if len(text) <= tail:
+        body = text
+    else:
+        body = "..." + text[-tail:]
+
+    return [
+        f"{len(text)} chars | <think> opened: {'yes' if opened else 'no'}"
+        f" | </think> closed: {'yes' if closed else 'no'}",
+        f"tail: {body!r}",
+    ]
 
 
 test_prompt = prompts[TEST_PROMPT_INDEX]
@@ -2718,6 +2756,17 @@ def stage_c_for_prompt(index):
 
     ift_generated = ift_run["generated_ids"]
     reasoning_generated = reasoning_run["generated_ids"]
+
+    # What each model actually produced. Without this the status line says a
+    # prompt was cut at the cap but not WHETHER the model was still reasoning
+    # or had quietly gone in circles -- and a non-periodic self-repeat inside
+    # <think> fires none of the detectors.
+    for label, run in (("IFT", ift_run), ("Reasoning", reasoning_run)):
+
+        print(f"\n  {label} generation:")
+
+        for line in generation_summary(run["text"]):
+            print("    " + line)
 
     ift_boundary_ids = turn_boundary_ids(ift_tokenizer)
     reasoning_boundary_ids = turn_boundary_ids(reasoning_tokenizer)

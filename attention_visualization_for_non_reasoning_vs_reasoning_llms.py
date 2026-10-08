@@ -18,6 +18,7 @@ Original notebook:
     https://colab.research.google.com/drive/1eezvrVvmYXf_veCtAFr6CNu1y9M-w_VG
 """
 
+import contextlib
 import hashlib
 import io
 import os
@@ -38,17 +39,27 @@ import torch
 #
 # Image is here because figures are displayed as encoded PNGs, not as Figure
 # objects -- see show_figure() for why.
-from IPython.display import Image, display
+#
+# Markdown is how a heading gets BOLD in the output. print() writes plain text,
+# so `print("**text**")` shows the asterisks rather than emphasising anything --
+# the run needs real emphasis on the headings it wants the reader to skip past.
+from IPython.display import Image, Markdown, display
 
 from models import get_model
 
 # Cap on generated tokens. Both models answer these prompts in long form (the
 # IFT model writes a full worked solution), so 256 was truncating them
-# mid-sentence. 1024 is enough for a complete answer on these prompts.
+# mid-sentence.
+#
+# NOT a safety net. The S5 run killed that assumption: 5 of the 7 `kind` prompts
+# ended at exactly this cap with no </think> and no answer -- opinion,
+# counterfactual, creative, math, math-trap. It is a real ceiling that the
+# reasoning model runs into, not a bound it never approaches.
 #
 # Cost warning: collect_prompt_attention() runs one forward pass per generated
 # token, so runtime is linear in generated length -- 1024 is roughly 4x the
-# work of 256, per model.
+# work of 256, per model. The cap is part of the cache key, so changing it
+# invalidates every cached prompt and pays that cost again.
 MAX_NEW_TOKENS = 1024
 
 # Where a completed (generation + attention) run is cached, for the life of the
@@ -70,22 +81,18 @@ if os.path.isdir("/content"):
 else:
     CACHE_DIR = os.path.join(tempfile.gettempdir(), "attn_cache")
 
-# Which entry of PROMPT_SPECS to analyse.
+# The single-prompt deep dive is GONE as of S5. It ran one PROMPT_SPECS index
+# through the full Stage A/B/C audit and printed that as the verbose reference --
+# but `%run` executes top to bottom, so every run led with that block, in a
+# different format from the sweep below, and the output read as two experiments
+# interleaved. The prompt-type sweep at the end of the file is now the whole run.
 #
-# Now 5 ("Which country has Paris as its capital?"). The France prompt (index 0)
-# settled the framing -- IFT answers directly, the reasoning model deliberates --
-# but its token table cannot be interpreted: the meaningful words ('France', '?')
-# are also the LAST words, so "reasoning weights meaningful words" and "reasoning
-# weights recent words" predict the same pattern.
-#
-# Index 5 is the same question asked the other way round. 'Paris' is the answer
-# and sits in the MIDDLE, while the last tokens ('capital', '?') are no longer
-# the answer. The two hypotheses now predict OPPOSITE things for 'Paris': high if
-# meaning drives attention, low if only position does. That one token decides it.
-#
-# Index 0 keeps its recorded expected values, so flipping back reproduces run #2
-# exactly -- and the run cache serves it without regenerating.
-TEST_PROMPT_INDEX = 5
+# Consequence, deliberate: the Stage A (sink heads), Stage B (position vs
+# meaning) and single-prompt per-token tables are no longer EXECUTED anywhere.
+# Their functions are still defined and still covered by the local harness, so
+# reviving any of them is a call, not a rewrite. The sink result also needs its
+# own phase-matched MASS test before it can be quoted again -- see project
+# history.
 
 # Declared but NOT currently used: generate_response() hardcodes
 # do_sample=False, so decoding is always greedy. See project history.
@@ -250,8 +257,6 @@ PROMPT_SPECS = [
         # crude marker MISSES: "5 cents", "five cents" -- read the response.
     },
 ]
-
-prompts = [spec["prompt"] for spec in PROMPT_SPECS]
 
 
 # Closing tag that ends the reasoning model's trace. Guessed from the '<think>'
@@ -1537,16 +1542,16 @@ def plot_shape_diff(labels, diff, title, up_label, down_label):
     return fig
 
 
-def _guard_status(label, generated_ids, boundary_ids, trim_start, trim_period):
-    """One line describing how a generation ended: stop, drift, loop, cap.
+def _guard_parts(label, generated_ids, boundary_ids, trim_start, trim_period):
+    """How a generation ended -- stop, drift, loop, cap -- as DATA.
 
-    Built from the SAME two detectors resolve_attention_trim() uses, so this
-    compact line cannot disagree with the trim it summarises.
+    Split out of _guard_status() so the per-prompt RESPONSE heading and the
+    guard line can both state the same fate. Two copies of this logic would
+    eventually disagree, and a heading that says "ended its own reply" above a
+    guard line that says CAP-HIT is worse than no heading at all.
 
-    Exists because the run spans many prompts: the six-line per-model block is
-    right for one prompt and unreadable for fourteen. The line keeps the
-    guards visible -- a prompt that degenerated, or one that hit the cap, is
-    reported rather than buried.
+    Built from the SAME two detectors resolve_attention_trim() uses, so nothing
+    here can disagree with the trim it describes.
     """
 
     n = len(generated_ids)
@@ -1564,9 +1569,133 @@ def _guard_status(label, generated_ids, boundary_ids, trim_start, trim_period):
     else:
         loop = f"LOOP@{trim_start}/period {trim_period}"
 
-    cap = "CAP-HIT" if n >= MAX_NEW_TOKENS else "under-cap"
+    return {
+        "label": label,
+        "n": n,
+        "stop": stop,
+        "loop": loop,
+        "cap": "CAP-HIT" if n >= MAX_NEW_TOKENS else "under-cap",
+    }
 
-    return f"{label:10s} {n:5d} tok | {stop:16s} | loop: {loop:22s} | {cap}"
+
+def _guard_status(label, generated_ids, boundary_ids, trim_start, trim_period):
+    """One line describing how a generation ended: stop, drift, loop, cap.
+
+    Exists because the run spans many prompts: the six-line per-model block is
+    right for one prompt and unreadable for fourteen. The line keeps the
+    guards visible -- a prompt that degenerated, or one that hit the cap, is
+    reported rather than buried.
+    """
+
+    p = _guard_parts(label, generated_ids, boundary_ids, trim_start, trim_period)
+
+    return (
+        f"{p['label']:10s} {p['n']:5d} tok | {p['stop']:16s} | "
+        f"loop: {p['loop']:22s} | {p['cap']}"
+    )
+
+
+def response_heading(label, parts):
+    """The heading above a full response: 'IFT RESPONSE (74 tok -- ...)'.
+
+    The fate is read off _guard_parts, the same dict the guard line formats, so
+    the heading cannot claim the model finished while the diagnostic line says
+    it hit the cap. Cap outranks the stop reason: a generation that ended on the
+    final token of the cap has not been shown to have chosen to stop.
+    """
+
+    if parts["cap"] == "CAP-HIT":
+        fate = "CAPPED mid-reply"
+    elif parts["stop"] == "clean-stop":
+        fate = "ended its own reply"
+    else:
+        fate = parts["stop"]
+
+    return f"{label} RESPONSE  ({parts['n']} tokens -- {fate})"
+
+
+def shape_table(labels, ift_shape, think_shape, answer_shape,
+                diff_models, diff_phase):
+    """The one per-token table: three normalized shapes and both differences.
+
+    The two diff columns are PASSED IN rather than recomputed here. They are the
+    exact arrays the C1/C2 figures draw, so the printed numbers and the bars
+    cannot disagree -- not through a second call, and not through a later edit
+    that changes one call site and not the other.
+
+    The SUM row is the invariant, not decoration: each shape column must sum to
+    1, so each diff column must sum to ~0. If a slice is ever added without
+    renormalising, the SUM row says so before any distance is read.
+    """
+
+    a = np.asarray(ift_shape, dtype=np.float64)
+    t = np.asarray(think_shape, dtype=np.float64)
+    r = np.asarray(answer_shape, dtype=np.float64)
+
+    d_models = np.asarray(diff_models, dtype=np.float64)
+    d_phase = np.asarray(diff_phase, dtype=np.float64)
+
+    df = pd.DataFrame({
+        "token": list(labels),
+        "IFT_answering": a,
+        "R_thinking": t,
+        "R_answering": r,
+        "R_answer_minus_IFT": d_models,
+        "R_answer_minus_thinking": d_phase,
+    })
+
+    df.loc[len(df)] = [
+        "SUM",
+        a.sum(),
+        t.sum(),
+        r.sum(),
+        d_models.sum(),
+        d_phase.sum(),
+    ]
+
+    return df
+
+
+def inference_facts(rows, total_prompts, skipped_indices):
+    """Counts from this run, and nothing else.
+
+    Deliberately mechanical. A template cannot tell "the model refused to stop"
+    from "the prompt got truncated", so no line here states a cause -- every
+    line is a count that can be checked against the blocks above it. The reading
+    of those counts is written by hand afterwards.
+    """
+
+    traced = [row for row in rows if row.get("C1_phase") is not None]
+
+    lines = [
+        f"prompts with a phase cut, i.e. with a C1/C2 number: "
+        f"{len(traced)} of {total_prompts}",
+        f"prompts skipped, i.e. no answering phase at all: "
+        f"{len(skipped_indices)} of {total_prompts}",
+    ]
+
+    if traced:
+
+        c1_bigger = [row for row in traced if row["C1_larger"] == "yes"]
+
+        lines.append(
+            f"C1 > C2, phase effect bigger than model gap: "
+            f"{len(c1_bigger)} of {len(traced)}"
+        )
+        lines.append(
+            "C1 / C2 per prompt: "
+            + ", ".join(
+                f"p{row['prompt']} {row['C1_phase']:.4f}/{row['C2_models']:.4f}"
+                for row in traced
+            )
+        )
+
+    if skipped_indices:
+        lines.append(
+            "skipped prompts: " + ", ".join(str(i) for i in skipped_indices)
+        )
+
+    return lines
 
 
 def render_figure_png(fig, dpi=130):
@@ -1609,6 +1738,56 @@ def show_figure(fig, dpi=130):
     plt.close(fig)
 
 
+def section(title):
+    """A BOLD heading in the output.
+
+    print() writes plain text, so `print("**text**")` shows the asterisks rather
+    than emphasising anything. Colab renders Markdown, so a heading that is
+    meant to be skimmable has to go through display(Markdown(...)).
+    """
+
+    display(Markdown(f"**{title}**"))
+
+
+def claude_block(lines):
+    """The diagnostics, under a heading that says who they are for in bold.
+
+    The heading is the contract: everything between it and the next heading is
+    for whoever is checking the numbers, not for whoever wants the result. One
+    place, always the same place -- so the reader learns one thing to skip
+    instead of hunting for which of five scattered debug prints matters.
+    """
+
+    display(Markdown("**FOR CLAUDE -- SKIP THIS BLOCK (diagnostics)**"))
+
+    for line in lines:
+
+        # A captured diagnostic can be several lines (verify_phase_cut's
+        # no-cut message is three). Indenting only the first would let the rest
+        # escape the block visually, so every line is indented.
+        parts = str(line).splitlines() or [""]
+
+        for part in parts:
+            print("      " + part)
+
+
+def capture_stdout(func, *args, **kwargs):
+    """(return value, captured stdout) for a function that prints its audit.
+
+    verify_phase_cut() in quiet mode prints its one-line audit rather than
+    returning it, and the loud path must keep doing exactly that -- the harness
+    pins both behaviours. Capturing the line here puts it in reading order
+    inside the diagnostics block instead of wherever the call happened to sit.
+    """
+
+    buffer = io.StringIO()
+
+    with contextlib.redirect_stdout(buffer):
+        result = func(*args, **kwargs)
+
+    return result, buffer.getvalue()
+
+
 def generation_summary(text, tail=700):
     """Two lines describing a generation: its shape, then its end.
 
@@ -1644,1109 +1823,82 @@ def generation_summary(text, tail=700):
     ]
 
 
-test_prompt = prompts[TEST_PROMPT_INDEX]
-test_spec = PROMPT_SPECS[TEST_PROMPT_INDEX]
-
-print("PROMPT:")
-print(test_prompt)
-
-print("\nGenerating with IFT model...")
-
-ift_run = run_and_cache("ift", ift_model, ift_tokenizer, test_prompt)
-
-ift_prompt_ids = ift_run["prompt_ids"]
-ift_generated_ids = ift_run["generated_ids"]
-ift_text = ift_run["text"]
-
-print("\nIFT RESPONSE:")
-print(ift_text)
-
-# Drop any repetition collapse before averaging. Averaging over a loop measures
-# the loop, not the solution -- the IFT model answers "capital of France" in one
-# line and then chats to the cap, so without this its average is mostly a
-# conversation loop.
-#
-# Two independent failures are cut here, because the France run showed that one
-# detector cannot see both (see find_drift_start / find_degenerate_tail for the
-# full account). resolve_attention_trim() applies both and reports which fired.
-ift_degenerate_start = ift_run["trim_start"]
-ift_degenerate_period = ift_run["trim_period"]
-
-ift_boundary_ids = turn_boundary_ids(ift_tokenizer)
-
-ift_attention_count = resolve_attention_trim(
-    "IFT",
-    ift_generated_ids,
-    ift_boundary_ids,
-    ift_degenerate_start,
-    ift_degenerate_period,
-)
-
-# Show what the cut actually landed on. A short window is the whole point here:
-# IFT's answer is ~9 tokens, so an off-by-one or a false-positive boundary id
-# would leave almost nothing to average and every number downstream would be
-# measuring the wrong tokens.
-verify_drift_cut(ift_tokenizer, ift_generated_ids, ift_boundary_ids)
-
-ift_attention_ids = ift_generated_ids[:ift_attention_count]
-
-if len(ift_attention_ids) == 0:
-    raise RuntimeError("IFT generation collapsed immediately; nothing to average.")
-
-# Rows of the cached tensor line up with generated tokens, so trimming is a
-# slice of the tensor -- no re-collection. Change the slice and re-`%run` and
-# the cache serves it back instantly.
-ift_attention = ift_run["attention"][:len(ift_attention_ids)]
-
-print("\nAttention tensor shape:")
-print(ift_attention.shape)
-
-ift_avg_attention = average_prompt_attention(ift_attention)
-
-print("\nAverage attention shape:")
-print(ift_avg_attention.shape)
-
-def display_attention(tokenizer, prompt_ids, average_attention):
-
-    tokens = tokenizer.convert_ids_to_tokens(
-        prompt_ids.tolist()
-    )
-
-    rows = []
-
-    for token, attention in zip(tokens, average_attention.tolist()):
-        rows.append({
-            "token": token,
-            "average_attention": attention
-        })
-
-    df = pd.DataFrame(rows)
-
-    return df
-
-
-# ift_df = display_attention(
-#     ift_tokenizer,
-#     ift_prompt_ids,
-#     ift_avg_attention
-# )
-
-# ift_df
-
-# The reasoning model is ALREADY resident -- it was loaded alongside the IFT
-# model near the top of this file. Do not load it again: a second copy costs
-# another ~6 GB in float32 on top of the resident IFT model, which exceeds the
-# T4's ~14.5 GB and makes accelerate silently offload weights to CPU/meta.
-# That offload is what hung the previous run.
-print("Reasoning model already loaded.")
-print("Dtype:", next(reasoning_model.parameters()).dtype)
-print("Device:", next(reasoning_model.parameters()).device)
-
-print("PROMPT:")
-print(test_prompt)
-
-print("\nGenerating with reasoning model...")
-
-reasoning_run = run_and_cache(
-    "reasoning",
-    reasoning_model,
-    reasoning_tokenizer,
-    test_prompt
-)
-
-reasoning_prompt_ids = reasoning_run["prompt_ids"]
-reasoning_generated_ids = reasoning_run["generated_ids"]
-reasoning_text = reasoning_run["text"]
-
-print("\nREASONING RESPONSE:")
-print(reasoning_text)
-
-print("\nGenerated tokens:")
-print(len(reasoning_generated_ids))
-
 # ============================================================
-# ANSWER CHECK
-# ============================================================
-
-print("\n" + "=" * 64)
-print("ANSWER CHECK (heuristic marker match -- read the response yourself)")
-print("=" * 64)
-
-print("Ground truth:", test_spec["ground_truth"])
-
-# IFT answers directly, so grade its whole response.
-ift_check = check_answer(ift_text, test_spec, scope="full")
-
-# The reasoning model must be graded ONLY after its trace closes: a marker found
-# inside <think> is working-out, not an answer. On the chickens/cows run the
-# reasoning model never emitted a closing tag, and the old whole-text check
-# called it CORRECT off '6' and '4' that only ever appeared mid-thought.
-reasoning_check = check_answer(reasoning_text, test_spec, scope="final")
-
-
-def report_check(label, result):
-
-    print(
-        f"{label}: {result['verdict']}"
-        f"   hits={result['hits']}  misses={result['misses']}"
-        f"   graded_chars={result['scope_chars']}"
-    )
-
-    for marker, pos in result["positions"].items():
-        print(f"           {marker!r} -> first at char {pos}")
-
-    if result["verdict"] == "NO FINAL ANSWER":
-        print(
-            "           no closing reasoning tag found, so the response ends "
-            "inside the trace and emitted no answer to grade"
-        )
-
-
-report_check("IFT      ", ift_check)
-report_check("Reasoning", reasoning_check)
-
-ift_verdict = ift_check["verdict"]
-reasoning_verdict = reasoning_check["verdict"]
-
-# Generated length matters for the comparison below: average_prompt_attention()
-# averages over however many tokens each model produced, so unequal counts mean
-# the two averages cover different amounts of each response.
-print(
-    f"Tokens generated -- IFT: {len(ift_generated_ids)}"
-    f"  Reasoning: {len(reasoning_generated_ids)}"
-)
-
-print("=" * 64)
-
-reasoning_degenerate_start = reasoning_run["trim_start"]
-reasoning_degenerate_period = reasoning_run["trim_period"]
-
-# Same two cut points as IFT, applied by the same function so the two models
-# cannot drift apart. The reasoning model may well have no turn markers at all
-# -- it closes its trace and answers -- in which case only the loop trim fires
-# and nothing changes for it.
-reasoning_boundary_ids = turn_boundary_ids(reasoning_tokenizer)
-
-reasoning_attention_count = resolve_attention_trim(
-    "Reasoning",
-    reasoning_generated_ids,
-    reasoning_boundary_ids,
-    reasoning_degenerate_start,
-    reasoning_degenerate_period,
-)
-
-verify_drift_cut(
-    reasoning_tokenizer,
-    reasoning_generated_ids,
-    reasoning_boundary_ids,
-)
-
-reasoning_attention_ids = reasoning_generated_ids[:reasoning_attention_count]
-
-if len(reasoning_attention_ids) == 0:
-    raise RuntimeError("Reasoning generation collapsed immediately; nothing to average.")
-
-reasoning_attention = reasoning_run["attention"][:len(reasoning_attention_ids)]
-
-reasoning_avg_attention = average_prompt_attention(
-    reasoning_attention
-)
-
-print("\nTokens used for attention (after drift and loop trims):")
-print(f"  IFT       : {len(ift_attention_ids)} / {len(ift_generated_ids)}")
-print(f"  Reasoning : {len(reasoning_attention_ids)} / {len(reasoning_generated_ids)}")
-
-# How much of each model's attention lands on the prompt at all, rather than on
-# its own generated tokens. This is the quantity the per-prompt renormalization
-# further down divides out, so it is NOT visible in the final comparison table.
-#
-# It is often the bigger effect: a model that mostly attends to its own
-# reasoning trace scores much lower here than one that keeps looking back at
-# the question.
-print("\nPrompt attention mass (share of attention on prompt tokens):")
-print(f"  IFT       : {ift_avg_attention.sum().item():.4f}")
-print(f"  Reasoning : {reasoning_avg_attention.sum().item():.4f}")
-print("  Scale: 1.0 means all attention stayed on prompt tokens.")
-
-print("\nAttention tensor shape:")
-print(reasoning_attention.shape)
-
-reasoning_df = display_attention(
-    reasoning_tokenizer,
-    reasoning_prompt_ids,
-    reasoning_avg_attention
-)
-
-display(reasoning_df)
-
-ift_tokens = ift_tokenizer.convert_ids_to_tokens(
-    ift_prompt_ids.tolist()
-)
-
-reasoning_tokens = reasoning_tokenizer.convert_ids_to_tokens(
-    reasoning_prompt_ids.tolist()
-)
-
-print("Same tokenization:", ift_tokens == reasoning_tokens)
-
-if ift_tokens != reasoning_tokens:
-    print("\nIFT tokens:")
-    print(ift_tokens)
-
-    print("\nReasoning tokens:")
-    print(reasoning_tokens)
-
-comparison = pd.DataFrame({
-    "token": ift_tokens,
-    "IFT_attention": ift_avg_attention.numpy(),
-    "Reasoning_attention": reasoning_avg_attention.numpy()
-})
-
-display(comparison)
-
-x = np.arange(len(comparison))
-width = 0.38
-
-fig, ax = plt.subplots(figsize=(14, 6))
-
-ax.bar(
-    x - width / 2,
-    comparison["IFT_attention"],
-    width,
-    label="IFT"
-)
-
-ax.bar(
-    x + width / 2,
-    comparison["Reasoning_attention"],
-    width,
-    label="Reasoning"
-)
-
-ax.set_xticks(x)
-ax.set_xticklabels(comparison["token"], rotation=60, ha="right")
-
-ax.set_ylabel("Average attention from generated tokens")
-ax.set_xlabel("Original prompt token")
-
-ax.set_title(
-    "Prompt-token attention: IFT vs Reasoning\n"
-    f"IFT: {ift_verdict}   |   Reasoning: {reasoning_verdict}"
-    f"   (ground truth: {test_spec['ground_truth']})"
-)
-
-ax.legend()
-
-fig.tight_layout()
-fig.savefig("ift_vs_reasoning_attention.png", dpi=150, bbox_inches="tight")
-
-# display(fig) rather than plt.show(): under `%run` there is no cell output
-# area for the inline backend to draw into, which is why the previous run
-# emitted a bare empty figure instead of the chart.
-display(fig)
-
-# ============================================================
-# TOKEN-BY-TOKEN ATTENTION COMPARISON
-# ONLY THE USER'S ACTUAL PROMPT
-# ============================================================
-
-# 1. Tokenize ONLY the user's actual prompt
-user_prompt_ids = ift_tokenizer.encode(
-    test_prompt,
-    add_special_tokens=False
-)
-
-user_tokens = [
-    ift_tokenizer.decode([token_id])
-    for token_id in user_prompt_ids
-]
-
-
-# 2. Re-create the FULL chat-template prompt
-messages = [
-    {"role": "user", "content": test_prompt}
-]
-
-full_inputs = ift_tokenizer.apply_chat_template(
-    messages,
-    add_generation_prompt=True,
-    tokenize=True,
-    return_dict=True,
-    return_tensors="pt"
-)
-
-full_ids = full_inputs["input_ids"][0].cpu()
-
-
-# 3. Find where the actual user prompt occurs
-user_ids_tensor = torch.tensor(user_prompt_ids)
-
-start = None
-
-for i in range(len(full_ids) - len(user_ids_tensor) + 1):
-
-    if torch.equal(
-        full_ids[i:i + len(user_ids_tensor)],
-        user_ids_tensor
-    ):
-        start = i
-        break
-
-if start is None:
-    raise ValueError("Could not find the user prompt inside the chat template.")
-
-end = start + len(user_prompt_ids)
-
-print("User prompt starts at full-sequence token:", start)
-print("User prompt ends at full-sequence token:", end - 1)
-print("Number of user prompt tokens:", len(user_tokens))
-
-
-# 4. Extract ONLY user-prompt attention
-ift_user_attention = ift_avg_attention[start:end]
-reasoning_user_attention = reasoning_avg_attention[start:end]
-
-
-# 5. Normalize within the USER PROMPT
-#
-# This makes the attention values sum to 1 for each model.
-#
-# Important:
-# Your earlier average_prompt_attention() already handled
-# different GENERATED lengths by averaging across generated
-# tokens.
-#
-# This second normalization handles the distribution INSIDE
-# the user prompt.
-
-ift_user_attention_norm = (
-    ift_user_attention /
-    ift_user_attention.sum()
-)
-
-reasoning_user_attention_norm = (
-    reasoning_user_attention /
-    reasoning_user_attention.sum()
-)
-
-
-# 6. Build the final token-by-token comparison
-comparison = pd.DataFrame({
-
-    "token": user_tokens,
-
-    "IFT_attention":
-        ift_user_attention_norm.numpy(),
-
-    "Reasoning_attention":
-        reasoning_user_attention_norm.numpy()
-
-})
-
-
-# 7. Add difference
-comparison["Reasoning_minus_IFT"] = (
-    comparison["Reasoning_attention"]
-    - comparison["IFT_attention"]
-)
-
-
-# 8. Display
-display(comparison)
-
-
-# ============================================================
-# STAGE A: WHERE DOES PROMPT ATTENTION ACTUALLY GO?
+# STAGE C ACROSS PROMPT TYPES  --  THIS IS THE RUN
 # ============================================================
 #
-# Every number above averages over all 28 layers and all 12 heads at once. The
-# reports below break that average apart, in increasing order of how much they
-# change what can be said:
+# The single-prompt deep dive that used to run first (Stage A sink heads, Stage
+# B position vs meaning, one prompt's full tables) is gone. `%run` executes top
+# to bottom, so it always printed a differently-shaped block BEFORE this sweep
+# and the output read as two experiments stapled together. Its functions are
+# still defined above and still covered by the local harness.
 #
-#   A1  sink share per (layer, head) -- is the sink concentrated in a few heads
-#       (a clean split, so dropping them is meaningful) or spread across nearly
-#       all of them (no clean split, so any threshold is arbitrary)?
-#   A2  sink share per layer -- are the early layers the sink, as the literature
-#       reports, leaving the middle layers readable?
-#   A3  redo the comparison using only the NON-sink heads. This is the one that
-#       decides whether "IFT looks at the prompt more" survives.
+# The question this run answers: does the IFT-vs-Reasoning attention-shape gap
+# depend on the KIND of question? The old single prompt was a factual lookup
+# with one retrievable answer, so there was little for the two models to differ
+# about. This sweeps every spec carrying a `kind` label -- opinion, explain-why,
+# counterfactual, ambiguous, creative, math, math-trap.
 #
-# Working on the TRIMMED tensor, so a repetition loop cannot skew a head's share
-# the way it skewed the whole-model average.
-
-ift_attn_np = ift_attention.numpy()
-reasoning_attn_np = reasoning_attention.numpy()
-
-ift_sink_share, ift_sink_mass = sink_profile(ift_attn_np)
-reasoning_sink_share, reasoning_sink_mass = sink_profile(reasoning_attn_np)
-
-n_layers, n_heads = ift_sink_share.shape
-
-# The determinism check compares against baselines recorded BEFORE the
-# drift-boundary trim existed, so it recomputes those six values under the old
-# PERIODIC-TAIL-ONLY rule. That is not a fudge: this check's job is to prove
-# generation, attention collection and tail detection are unchanged, and those
-# are exactly the things the tail-only basis measures. The trim POLICY is a
-# downstream choice and is not what this check is testing -- without the split,
-# adding drift detection would read as a regression on every prompt recorded
-# earlier.
-ift_tail_only_ids = (
-    ift_generated_ids
-    if ift_degenerate_start is None
-    else ift_generated_ids[:ift_degenerate_start]
-)
-
-reasoning_tail_only_ids = (
-    reasoning_generated_ids
-    if reasoning_degenerate_start is None
-    else reasoning_generated_ids[:reasoning_degenerate_start]
-)
-
-ift_check_avg = average_prompt_attention(
-    ift_run["attention"][:len(ift_tail_only_ids)]
-)
-reasoning_check_avg = average_prompt_attention(
-    reasoning_run["attention"][:len(reasoning_tail_only_ids)]
-)
-
-print("\n" + "=" * 64)
-print(f"DETERMINISM CHECK -- {test_spec['prompt']}")
-print("=" * 64)
-print("Measured under the periodic-tail rule alone, so the numbers stay")
-print("comparable to baselines recorded before the drift trim was added.")
-
-expected = test_spec.get("expected")
-
-if expected is None:
-
-    # A prompt with no recorded baseline is not a failure -- it is the first
-    # measurement. Print the values so they can be pasted back into the spec,
-    # which turns the next run into a real check rather than a fresh start.
-    print("No baseline recorded for this prompt. Greedy decoding is reproducible,")
-    print("so these values should repeat exactly on the next run -- record them in")
-    print("PROMPT_SPECS['expected'] to turn that repetition into a real check.")
-
-    print(
-        f"  trim          IFT {len(ift_tail_only_ids)}/{len(ift_generated_ids)}"
-        f" (period {ift_degenerate_period})"
-        f"   Reasoning {len(reasoning_tail_only_ids)}/{len(reasoning_generated_ids)}"
-        f" (period {reasoning_degenerate_period})"
-    )
-    print(
-        f"  token {SINK_INDEX} attention  IFT {float(ift_check_avg[SINK_INDEX]):.4f}"
-        f"   Reasoning {float(reasoning_check_avg[SINK_INDEX]):.6f}"
-    )
-    print(
-        f"  prompt mass   IFT {float(ift_check_avg.sum()):.4f}"
-        f"   Reasoning {float(reasoning_check_avg.sum()):.4f}"
-    )
-
-else:
-
-    checks = [
-        (
-            "IFT trim (n_used, n_generated, period)",
-            (len(ift_tail_only_ids), len(ift_generated_ids), ift_degenerate_period),
-            expected["ift_trim"],
-        ),
-        (
-            "Reasoning trim (n_used, n_generated, period)",
-            (len(reasoning_tail_only_ids), len(reasoning_generated_ids), reasoning_degenerate_period),
-            expected["reasoning_trim"],
-        ),
-        ("IFT token 0 attention", float(ift_check_avg[SINK_INDEX]), expected["ift_token0"]),
-        ("Reasoning token 0 attention", float(reasoning_check_avg[SINK_INDEX]), expected["reasoning_token0"]),
-        ("IFT prompt mass", float(ift_check_avg.sum()), expected["ift_mass"]),
-        ("Reasoning prompt mass", float(reasoning_check_avg.sum()), expected["reasoning_mass"]),
-    ]
-
-    all_ok = True
-
-    for label, got, want in checks:
-
-        if isinstance(want, tuple):
-            ok = tuple(got) == tuple(want)
-        else:
-            # Attention goes through float32 on disk, so compare at recorded
-            # precision rather than for bit equality.
-            ok = abs(got - want) < 1e-4
-
-        all_ok = all_ok and ok
-
-        print(f"  {'ok  ' if ok else 'FAIL'} {label}: got {got}  expected {want}")
-
-    if all_ok:
-        print("\nReproduced exactly -- the cache and the pipeline are unchanged.")
-    else:
-        print("\nMISMATCH. Stop here: nothing below is comparable to the baseline.")
-
-print("\n" + "=" * 64)
-print("STAGE A1: SINK SHARE PER LAYER AND HEAD")
-print("=" * 64)
-
-print(f"Sink = prompt token {SINK_INDEX} ({ift_tokens[SINK_INDEX]!r}), the first")
-print("token of the rendered chat template. Each cell is the fraction of that")
-print("head's prompt attention that lands on the sink.")
-print("  1.00 = pure sink head, holds no information about the question")
-print("  0.00 = never looks at the sink at all")
-
-ift_share_df = pd.DataFrame(
-    ift_sink_share.round(2),
-    columns=[f"h{h}" for h in range(n_heads)]
-)
-
-ift_share_df.insert(0, "layer", range(n_layers))
-
-display(ift_share_df)
-
-print("\nHow many IFT heads are sink-dominant?")
-for threshold in (0.9, 0.75, 0.5, 0.2):
-    n = int((ift_sink_share > threshold).sum())
-    print(
-        f"  share > {threshold:<5}: {n:3d} of {ift_sink_share.size} heads"
-        f" ({100 * n / ift_sink_share.size:5.1f}%)"
-    )
-
-# The shape of the distribution is the real question, not any one threshold: a
-# two-hump distribution means sink heads and reader heads are genuinely distinct
-# groups, so a threshold cuts between them. One smear means there is no such
-# split and the threshold is picking an arbitrary line.
-edges = np.linspace(0.0, 1.0, 11)
-counts, _ = np.histogram(ift_sink_share, bins=edges)
-
-print("\nDistribution of IFT sink shares. Two humps = a real split; one fat")
-print("hump = any threshold is arbitrary:")
-
-for lo, hi, count in zip(edges[:-1], edges[1:], counts):
-    bar = "#" * int(round(count / max(counts.max(), 1) * 40))
-    print(f"  {lo:.1f}-{hi:.1f}  {count:3d}  {bar}")
-
-print("\n" + "=" * 64)
-print("STAGE A2: SINK SHARE PER LAYER")
-print("=" * 64)
-
-layer_df = pd.DataFrame({
-    "layer": range(n_layers),
-    "IFT_mean_sink_share": ift_sink_share.mean(axis=1).round(3),
-    "Reasoning_mean_sink_share": reasoning_sink_share.mean(axis=1).round(3),
-    "IFT_heads_above_0.5": (ift_sink_share > 0.5).sum(axis=1),
-    "Reasoning_heads_above_0.5": (reasoning_sink_share > 0.5).sum(axis=1),
-})
-
-display(layer_df)
-
-print("\nWhere the prompt attention mass actually sits, per layer:")
-print("(mass = that layer's total prompt attention, before any normalization)")
-
-layer_mass_df = pd.DataFrame({
-    "layer": range(n_layers),
-    "IFT_mass": ift_sink_mass.sum(axis=1).round(5),
-    "Reasoning_mass": reasoning_sink_mass.sum(axis=1).round(5),
-})
-
-display(layer_mass_df)
-
-print("\n" + "=" * 64)
-print("STAGE A3: THE COMPARISON WITH SINK HEADS REMOVED")
-print("=" * 64)
-
-ift_full_mass = float(ift_avg_attention.sum())
-reasoning_full_mass = float(reasoning_avg_attention.sum())
-
-# Content mass = prompt attention with the sink column removed. Everything below
-# is reported as a share of THIS, not of the raw prompt mass, because a share of
-# the raw mass mostly measures the sink.
-ift_content_mass = content_mass(ift_attn_np)
-reasoning_content_mass = content_mass(reasoning_attn_np)
-
-if_to_mean = ift_sink_mass.size
-re_to_mean = reasoning_sink_mass.size
-
-print(
-    f"Prompt mass, all heads -- IFT {ift_full_mass:.4f}"
-    f"   Reasoning {reasoning_full_mass:.4f}"
-)
-print(
-    f"  the sink alone is"
-    f" IFT {float(ift_avg_attention[SINK_INDEX]):.4f}"
-    f" ({100 * float(ift_avg_attention[SINK_INDEX]) / ift_full_mass:.1f}%)"
-    f"   Reasoning {float(reasoning_avg_attention[SINK_INDEX]):.4f}"
-    f" ({100 * float(reasoning_avg_attention[SINK_INDEX]) / reasoning_full_mass:.1f}%)"
-)
-print(
-    f"  non-sink CONTENT mass (the real budget) --"
-    f" IFT {ift_content_mass / if_to_mean:.4f}"
-    f"   Reasoning {reasoning_content_mass / re_to_mean:.4f}"
-)
-print("  (same per-head average scale as the line above, sink column removed)")
-
-# Two thresholds on purpose. A finding that holds at both is robust; a finding
-# that flips between them was a property of the threshold, not of the models.
-for threshold in (0.9, 0.5):
-
-    ift_vec, ift_retained, ift_kept, ift_total = keep_reader_heads(
-        ift_attn_np, ift_sink_share, threshold
-    )
-
-    reasoning_vec, reasoning_retained, reasoning_kept, reasoning_total = (
-        keep_reader_heads(reasoning_attn_np, reasoning_sink_share, threshold)
-    )
-
-    print("\n" + "-" * 64)
-    print(f"Threshold: drop heads whose sink share exceeds {threshold}")
-
-    print(
-        f"  IFT       kept {ift_kept:3d}/{ift_total} heads,"
-        f" holding {100 * ift_retained:6.2f}% of all non-sink content attention"
-    )
-    print(
-        f"  Reasoning kept {reasoning_kept:3d}/{reasoning_total} heads,"
-        f" holding {100 * reasoning_retained:6.2f}% of all non-sink content attention"
-    )
-
-    # Content mass with the sink column removed, so this number is comparable
-    # across thresholds (unlike the raw prompt mass, which is mostly sink).
-    ift_reader_mass = float(ift_vec.sum()) / ift_total
-    reasoning_reader_mass = float(reasoning_vec.sum()) / reasoning_total
-
-    print(
-        f"  content mass on the prompt -- IFT {ift_reader_mass:.5f}"
-        f"   Reasoning {reasoning_reader_mass:.5f}"
-    )
-
-    if reasoning_reader_mass > 0:
-        print(
-            f"  IFT / Reasoning = {ift_reader_mass / reasoning_reader_mass:.3f}"
-            "   (1.0 = the two models read the prompt equally)"
-        )
-
-    # Same user-prompt window as the table at the top of the file: `start` and
-    # `end` are the location of the raw user prompt inside the chat template,
-    # found above.
-    ift_user = ift_vec[start:end]
-    reasoning_user = reasoning_vec[start:end]
-
-    reader_df = pd.DataFrame({
-        "token": user_tokens,
-        "IFT_attention": ift_user,
-        "Reasoning_attention": reasoning_user,
-    })
-
-    reader_df["Reasoning_minus_IFT"] = (
-        reader_df["Reasoning_attention"] - reader_df["IFT_attention"]
-    )
-
-    print("\n  reader heads only, raw (unnormalized) attention per user token:")
-    display(reader_df)
-
-    mean_abs_raw = float(np.abs(reader_df["Reasoning_minus_IFT"]).mean())
-
-    ift_denom = float(ift_user.sum())
-    reasoning_denom = float(reasoning_user.sum())
-
-    if ift_denom > 0 and reasoning_denom > 0:
-        diff_norm = reasoning_user / reasoning_denom - ift_user / ift_denom
-        mean_abs_norm = float(np.abs(diff_norm).mean())
-
-        print("\n  reader heads only, each column rescaled to sum to 1:")
-        display(pd.DataFrame({
-            "token": user_tokens,
-            "IFT_attention": ift_user / ift_denom,
-            "Reasoning_attention": reasoning_user / reasoning_denom,
-            "Reasoning_minus_IFT": diff_norm,
-        }))
-    else:
-        mean_abs_norm = float("nan")
-
-    print(
-        f"\n  mean |Reasoning - IFT| across user tokens --"
-        f" raw {mean_abs_raw:.5f}, rescaled {mean_abs_norm:.5f}"
-    )
-    print("  (the France prompt, all heads, was 0.0122)")
-
-
-# ============================================================
-# STAGE B: IS ATTENTION JUST POSITION?
-# ============================================================
+# Per prompt the output is, IN THIS ORDER:
 #
-# The France prompt could not answer this. Its meaningful tokens ('France', '?')
-# were also its LAST tokens, so "meaning" and "recency" predicted the same thing
-# and no amount of analysis could pull them apart. The position-swap prompt moves
-# the answer word into the middle, where the two hypotheses disagree.
+#   1. the prompt
+#   2. IFT's FULL response, then Reasoning's FULL response
+#   3. one table: all three normalized shapes per token + both differences
+#   4. two diverging-bar figures -- C2 (model comparison), C1 (phase yardstick)
+#   5. a BOLD "FOR CLAUDE -- SKIP" block holding the diagnostics
 #
-# Three reports, strongest evidence last:
+# The bold heading is the contract: everything under it is for checking the
+# numbers, not for reading the result. It is bold because print() cannot be --
+# print("**x**") shows the asterisks.
 #
-#   B1  rank each user token by attention and by position. Where the rankings
-#       agree, the table is a recency ramp; where they disagree, something else
-#       is at work.
-#   B2  the same table labelled by ROLE (question word / filler / ANSWER), so two
-#       differently-worded prompts can be compared by what a token does rather
-#       than where it sits.
-#   B3  repeated tokens -- identical meaning at different positions. The cleanest
-#       test in the data, and it needs no new generation or new prompt.
-
-print("\n" + "=" * 64)
-print("STAGE B: IS ATTENTION JUST POSITION?")
-print("=" * 64)
-
-print(f"Prompt: {test_prompt}")
-
-ift_user_raw = ift_avg_attention[start:end].numpy()
-reasoning_user_raw = reasoning_avg_attention[start:end].numpy()
-
-ift_attn_rank, pos_rank = rank_positions_vs_attention(ift_user_raw)
-reasoning_attn_rank, _ = rank_positions_vs_attention(reasoning_user_raw)
-
-print("\nB1. Attention rank vs position rank  (pos_rank 1 = the LAST token)")
-print("    shift = pos_rank - attn_rank")
-print("      shift > 0  -> attended MORE than its position explains (meaning)")
-print("      shift ~ 0  -> attention is what position alone predicts")
-print("      shift < 0  -> attended LESS than its position explains")
-
-stage_b_df = pd.DataFrame({
-    "pos": list(range(len(user_tokens))),
-    "token": user_tokens,
-    "IFT_attn": ift_user_raw,
-    "IFT_rank": ift_attn_rank,
-    "pos_rank": pos_rank,
-    "IFT_shift": pos_rank - ift_attn_rank,
-    "R_attn": reasoning_user_raw,
-    "R_rank": reasoning_attn_rank,
-    "R_shift": pos_rank - reasoning_attn_rank,
-})
-
-roles = test_spec.get("roles")
-
-if roles and len(roles) == len(user_tokens):
-    stage_b_df.insert(1, "role", roles)
-elif roles:
-    print(
-        f"\nNOTE: the spec lists {len(roles)} roles but this prompt tokenizes to "
-        f"{len(user_tokens)} tokens, so the role column is omitted rather than "
-        f"guessed. Roles given: {roles}"
-    )
-
-display(stage_b_df)
-
-print("\nRank correlation between attention and position, per model:")
-print("  1.0 = a pure recency ramp. 0.0 = position explains nothing.")
-
-for label, attn_rank in (("IFT", ift_attn_rank), ("Reasoning", reasoning_attn_rank)):
-    print(f"  {label:10s}: {rank_correlation(attn_rank, pos_rank):+.3f}")
-
-print("\nThe token to look at is the ANSWER word. If it sits near the bottom of")
-print("the attention ranking while sitting in the MIDDLE of the prompt, then")
-print("position is driving the table and meaning is not.")
-
-
-# ------------------------------------------------------------
-# B3. The same token, at several different positions
-# ------------------------------------------------------------
-
-print("\n" + "-" * 64)
-print("B3. Identical tokens at different positions")
-print("-" * 64)
-print("A token that means the same thing every time it appears. Any attention")
-print("difference between its occurrences is positional by construction, so this")
-print("is the cleanest position test in the data -- no new prompt, no new run.")
-print("It also says whether the recency reading generalises beyond the question")
-
-ift_attn_all = ift_avg_attention.numpy()
-reasoning_attn_all = reasoning_avg_attention.numpy()
-
-ift_groups = repeated_token_groups(ift_tokens, ift_attn_all)
-reasoning_groups = repeated_token_groups(reasoning_tokens, reasoning_attn_all)
-
-repeated = sorted(
-    (token for token in ift_groups if token in reasoning_groups),
-    key=lambda token: -len(ift_groups[token]),
-)
-
-tested_any = False
-
-for token in repeated:
-
-    if len(ift_groups[token]) < 3:
-        continue
-
-    tested_any = True
-
-    print(f"\n{token!r} appears {len(ift_groups[token])} times")
-
-    for label, groups in (("IFT      ", ift_groups), ("Reasoning", reasoning_groups)):
-
-        positions = [position for position, _ in groups[token]]
-        values = [value for _, value in groups[token]]
-
-        shown = "   ".join(f"pos{position}={value:.5f}" for position, value in groups[token])
-
-        print(f"  {label}: {shown}")
-        print(
-            f"               correlation with position: "
-            f"{rank_correlation(positions, values):+.3f}"
-        )
-
-    # The sink appears more than once too, and its position-0 occurrence would
-    # dominate any correlation -- so flag it rather than let it masquerade as
-    # independent evidence.
-    if token == ift_tokens[SINK_INDEX]:
-        print(
-            "  NOTE: one of these occurrences IS the sink (position 0). A high"
-            " correlation here restates the sink finding, it does not corroborate"
-            " it."
-        )
-
-if not tested_any:
-    print("\nNo token repeats three or more times, so B3 has nothing to test.")
-
-print("\n" + "-" * 64)
-print("HOW TO READ STAGE B")
-print("-" * 64)
-print("  * ANSWER token ranks high, shift strongly positive -> meaning drives")
-print("    attention, and the token-level table in the main report is real.")
-print("  * Every shift near 0 and rank correlation near 1.0 -> position alone")
-print("    explains the table, and the IFT/Reasoning split is a recency effect")
-print("    rather than attention to content.")
-print("  * B3 breaks ties: identical tokens, so any spread there is positional by")
-print("    construction -- except for the sink, which is flagged.")
-
-
-# ============================================================
-# STAGE C: PROMPT-ATTENTION SHAPE, PHASE-MATCHED
-# ============================================================
+# The measurement, unchanged from S4:
+#   shape = attention renormalized over the prompt's own words, sums to 1
+#   C1    = Reasoning thinking vs Reasoning answering, same model
+#   C2    = IFT answering vs Reasoning answering, phase-matched
+# The sink at full-sequence index 0 sits OUTSIDE the user-token slice, so it is
+# excluded structurally and can never leak into a shape.
 #
-# Everything above compares HOW MUCH attention each model puts on the prompt, or
-# averages over the whole generation. Both are contaminated by the fact that the
-# two models' generations do different jobs: the reasoning model deliberates
-# first, the IFT model does not deliberate at all.
-#
-# Stage C drops the "how much" question entirely and asks only about SHAPE -- the
-# distribution of attention across the prompt's own words, renormalized to sum to
-# 1. Because it is renormalized, unequal prompt-attention totals cancel out, and
-# because it is sliced to a single phase, unequal generation lengths cancel too.
-#
-#   C1  Reasoning thinking vs Reasoning answering  -> the PHASE yardstick.
-#       Same model, so any difference here cannot be a model difference.
-#   C2  IFT vs Reasoning answering                 -> the real comparison,
-#       both models writing their answer.
-#
-# Nothing below runs unless the trace-end cut is confirmed by verify_phase_cut.
-
-print("\n" + "=" * 64)
-print("STAGE C: PROMPT-ATTENTION SHAPE, PHASE-MATCHED")
-print("=" * 64)
-
-print(f"Prompt: {test_prompt}")
-print(f"User prompt tokens: {user_tokens}")
-print(
-    f"User prompt = full-sequence tokens {start}..{end - 1}"
-    " (the sink at index 0 is outside this range, so it is never part of a shape)"
-)
-
-# ------------------------------------------------------------
-# Where the reasoning trace closes, verified before it is used
-# ------------------------------------------------------------
-
-reasoning_cut = find_trace_end(reasoning_generated_ids, reasoning_tokenizer)
-
-verify_phase_cut(reasoning_tokenizer, reasoning_generated_ids, reasoning_cut)
-
-reasoning_full = _as_numpy(reasoning_run["attention"])
-ift_full = _as_numpy(ift_run["attention"])
-
-# The generation end, after the loop/drift trim. Post-eos this equals the full
-# generation; printed either way so a trim that actually removed something is
-# visible rather than assumed away.
-reasoning_end = len(reasoning_attention_ids)
-ift_end = len(ift_attention_ids)
-
-print(
-    f"\nWindows available --"
-    f"  IFT {ift_end}/{ift_full.shape[0]} tokens"
-    f"   Reasoning {reasoning_end}/{reasoning_full.shape[0]} tokens"
-    f" (post-trim / generated)"
-)
-
-stage_c_ok = True
-
-if reasoning_cut is None:
-
-    stage_c_ok = False
-
-    print("\nSKIPPED: no trace-closing tag in the reasoning generation, so its")
-    print("answer phase cannot be located and C1/C2 would not be comparing what")
-    print("they claim to. Nothing below is printed rather than printing numbers")
-    print("under a label that is false.")
-
-else:
-
-    think_tokens = reasoning_cut
-    answer_tokens = reasoning_end - reasoning_cut
-
-    if think_tokens < 1 or answer_tokens < 1:
-        stage_c_ok = False
-        print(
-            f"\nSKIPPED: the cut leaves an empty phase --"
-            f" thinking {think_tokens}, answering {answer_tokens}."
-        )
-
-    if reasoning_end > reasoning_full.shape[0] or ift_end > ift_full.shape[0]:
-        stage_c_ok = False
-        print("\nSKIPPED: a window is longer than the tensor it slices.")
-
-if stage_c_ok:
-
-    ift_shape = prompt_shape(ift_full, start, end, lo=0, hi=ift_end)
-
-    reasoning_think_shape = prompt_shape(
-        reasoning_full, start, end, lo=0, hi=reasoning_cut
-    )
-
-    reasoning_answer_shape = prompt_shape(
-        reasoning_full, start, end, lo=reasoning_cut, hi=reasoning_end
-    )
-
-    # Structural invariants. A shape that does not sum to 1, or phases that do
-    # not add up to the generation, means the slicing is wrong -- so these are
-    # checked before any distance is quoted.
-    for label, shape in (
-        ("IFT", ift_shape),
-        ("Reasoning-think", reasoning_think_shape),
-        ("Reasoning-answer", reasoning_answer_shape),
-    ):
-        total = float(np.abs(shape).sum())
-
-        print(
-            f"  {label:16s} sum of |weights| = {total:.6f}"
-            f"   ({'ok' if abs(total - 1.0) < 1e-6 else 'BAD -- not normalized'})"
-        )
-
-    tv_phase = total_variation_distance(reasoning_think_shape, reasoning_answer_shape)
-    tv_models = total_variation_distance(ift_shape, reasoning_answer_shape)
-
-    print("\n" + "-" * 64)
-    print("C1. THE PHASE YARDSTICK -- same model, thinking vs answering")
-    print("-" * 64)
-    print(
-        f"Reasoning thinking : tokens 0..{reasoning_cut - 1}"
-        f" ({think_tokens} tokens)"
-    )
-    print(
-        f"Reasoning answering: tokens {reasoning_cut}..{reasoning_end - 1}"
-        f" ({answer_tokens} tokens)"
-    )
-
-    display(pd.DataFrame({
-        "token": user_tokens,
-        "Reasoning_thinking": reasoning_think_shape,
-        "Reasoning_answering": reasoning_answer_shape,
-        "answering_minus_thinking": reasoning_answer_shape - reasoning_think_shape,
-    }))
-
-    print(
-        f"\n  TOTAL VARIATION DISTANCE (thinking vs answering): {tv_phase:.4f}"
-    )
-    print("  0.00 = thinking and answering look at the prompt identically")
-    print("  1.00 = they have nothing in common")
-    print("  THIS IS THE NUMBER THAT DECIDES WHETHER C2 CAN BE TRUSTED.")
-
-    print("\n" + "-" * 64)
-    print("C2. THE COMPARISON -- IFT vs Reasoning, both answering")
-    print("-" * 64)
-    print(f"IFT window       : tokens 0..{ift_end - 1} ({ift_end} tokens)")
-    print(
-        f"Reasoning window : tokens {reasoning_cut}..{reasoning_end - 1}"
-        f" ({answer_tokens} tokens), after its trace closed"
-    )
-
-    display(pd.DataFrame({
-        "token": user_tokens,
-        "IFT_attention": ift_shape,
-        "Reasoning_answering": reasoning_answer_shape,
-        "Reasoning_minus_IFT": reasoning_answer_shape - ift_shape,
-    }))
-
-    print(
-        f"\n  TOTAL VARIATION DISTANCE (IFT vs Reasoning, both answering):"
-        f" {tv_models:.4f}"
-    )
-
-    print("\n" + "=" * 64)
-    print("HOW TO READ STAGE C")
-    print("=" * 64)
-    print("  * Compare C1's distance to C2's before believing C2.")
-    print("  * C1 large (say, well above ~0.3): a model's shape depends heavily on")
-    print("    whether it is thinking or answering. C2 is then only meaningful as a")
-    print("    phase-matched comparison, and prompt-attention mass is off the table.")
-    print("  * C1 small: the phase effect is minor, and C2's gap is closer to a real")
-    print("    model difference.")
-    print("  * IFT's window is ~a few tokens. A shape from that few samples is")
-    print("    noisy -- read the table, not just the distance.")
-
-    print(
-        f"\nHEADLINE NUMBERS -- phase yardstick (C1, same model): {tv_phase:.4f}"
-        f"   model comparison (C2, matched phase): {tv_models:.4f}"
-    )
-
-else:
-
-    print("\nStage C produced no numbers. See the SKIPPED reason above.")
-
-
-# ============================================================
-# STAGE C ACROSS PROMPT TYPES
-# ============================================================
-#
-# Everything above analyses TEST_PROMPT_INDEX alone. That answers "what happens
-# on this one question" and cannot answer the question the reframe exists for:
-# does the IFT-vs-Reasoning shape gap depend on the KIND of question?
-#
-# Index 5 is a factual lookup with a single retrievable answer, so both models
-# converge and there is little for them to differ about. A prompt with no
-# retrievable answer is where a real difference would show -- and a math or logic
-# prompt with a trap answer is where deliberation demonstrably does work.
-#
-# This block runs the same Stage C measurement over every spec carrying a `kind`
-# label and prints, per prompt: a status line, the window sizes, C1 and C2, the
-# paired per-word table, and TWO diverging-bar figures --
-#
-#   C2  Reasoning answering vs IFT answering    (the model comparison)
-#   C1  Reasoning answering vs Reasoning thinking (the phase yardstick)
-#
-# The loop is DERIVED from PROMPT_SPECS, not a second hand-kept list. Adding a
-# spec with a `kind` is all it takes to include it; two parallel lists that must
-# be edited in lockstep is how TEST_PROMPT_INDEX already drifted once.
+# NEW_PROMPT_INDICES is DERIVED from PROMPT_SPECS, not a second hand-kept list.
+# Adding a spec with a `kind` is all it takes; two parallel lists edited in
+# lockstep is how the old TEST_PROMPT_INDEX drifted once.
 
 NEW_PROMPT_INDICES = [
     index for index, spec in enumerate(PROMPT_SPECS) if spec.get("kind")
 ]
 
-print("\n" + "=" * 64)
-print("STAGE C ACROSS PROMPT TYPES")
-print("=" * 64)
+section(f"STAGE C ACROSS PROMPT TYPES -- {len(NEW_PROMPT_INDICES)} prompts")
 print(
-    f"{len(NEW_PROMPT_INDICES)} prompts carry a `kind` label: "
+    "   kinds: "
     + ", ".join(f"{i}:{PROMPT_SPECS[i]['kind']}" for i in NEW_PROMPT_INDICES)
 )
 
 
 def stage_c_for_prompt(index):
-    """C1, C2, both tables and both figures for one prompt.
+    """One prompt, one block, in reading order.
+
+    Ordering is the point. Before this, the response text was a 700-char tail
+    printed several screens away from the table describing it, with the
+    diagnostics wedged in between. Now the prompt, both full responses, the
+    table and the two figures are contiguous, and every diagnostic is collected
+    and printed ONCE at the end under a heading that says to skip it.
 
     Returns a row dict, or None when the prompt is not comparable (no
     trace-closing tag, an empty phase, or a shape that is not normalized).
 
-    A skipped prompt is NOT plotted and NOT given numbers: a chart drawn from a
-    phase that was never located carries the same false label as a number would.
+    A skipped prompt still prints BOTH FULL RESPONSES: on the five prompts where
+    the reasoning model never left <think>, the response IS the result, and a
+    status line saying CAP-HIT is not something a reader can check. What a
+    skipped prompt does not get is a table or a figure -- a chart drawn from a
+    phase that was never located carries the same false label a number would.
     """
 
     spec = PROMPT_SPECS[index]
     prompt = spec["prompt"]
     kind = spec["kind"]
 
-    print("\n" + "#" * 64)
-    print(f"# PROMPT {index} -- kind: {kind}")
-    print("#" * 64)
+    print("\n" + "=" * 72)
+    print(f"PROMPT {index}   |   kind: {kind}")
+    print("=" * 72)
     print(prompt)
 
     ift_run = run_and_cache("ift", ift_model, ift_tokenizer, prompt)
@@ -2757,19 +1909,45 @@ def stage_c_for_prompt(index):
     ift_generated = ift_run["generated_ids"]
     reasoning_generated = reasoning_run["generated_ids"]
 
-    # What each model actually produced. Without this the status line says a
-    # prompt was cut at the cap but not WHETHER the model was still reasoning
-    # or had quietly gone in circles -- and a non-periodic self-repeat inside
-    # <think> fires none of the detectors.
-    for label, run in (("IFT", ift_run), ("Reasoning", reasoning_run)):
-
-        print(f"\n  {label} generation:")
-
-        for line in generation_summary(run["text"]):
-            print("    " + line)
-
     ift_boundary_ids = turn_boundary_ids(ift_tokenizer)
     reasoning_boundary_ids = turn_boundary_ids(reasoning_tokenizer)
+
+    # The fate facts, computed once. The response heading AND the guard line are
+    # both formatted from these, so a heading cannot say a model ended its own
+    # reply while the diagnostic line under it says the model hit the cap.
+    ift_parts = _guard_parts(
+        "IFT", ift_generated, ift_boundary_ids,
+        ift_run["trim_start"], ift_run["trim_period"],
+    )
+    reasoning_parts = _guard_parts(
+        "Reasoning", reasoning_generated, reasoning_boundary_ids,
+        reasoning_run["trim_start"], reasoning_run["trim_period"],
+    )
+
+    section(response_heading("IFT", ift_parts))
+    print(ift_run["text"])
+
+    section(response_heading("REASONING", reasoning_parts))
+    print(reasoning_run["text"])
+
+    # Diagnostics accumulate here and print together at the end, so nothing
+    # interrupts the prompt -> responses -> table -> figures reading order.
+    diag = [
+        _guard_status(
+            "IFT", ift_generated, ift_boundary_ids,
+            ift_run["trim_start"], ift_run["trim_period"],
+        ),
+        _guard_status(
+            "Reasoning", reasoning_generated, reasoning_boundary_ids,
+            reasoning_run["trim_start"], reasoning_run["trim_period"],
+        ),
+        # Line 0 only: the char count and the <think>/</think> flags. The tail is
+        # line 1, and the whole response is printed above, so repeating it is
+        # noise. Kept in the diagnostics because "did it ever close <think>" is
+        # the fact that decides whether this prompt can be measured at all.
+        "IFT       " + generation_summary(ift_run["text"])[0],
+        "Reasoning " + generation_summary(reasoning_run["text"])[0],
+    ]
 
     # quiet=True: one status line replaces the per-model block. The trim itself
     # still comes from the single shared function, so the two models cannot
@@ -2791,56 +1969,72 @@ def stage_c_for_prompt(index):
         quiet=True,
     )
 
-    # The loop/stop guards, one line each. A prompt that degenerated or hit the
-    # cap says so here rather than in a wall of text nobody reads.
-    print("  " + _guard_status(
-        "IFT", ift_generated, ift_boundary_ids,
-        ift_run["trim_start"], ift_run["trim_period"],
-    ))
-    print("  " + _guard_status(
-        "Reasoning", reasoning_generated, reasoning_boundary_ids,
-        reasoning_run["trim_start"], reasoning_run["trim_period"],
-    ))
-
     start, end, labels = locate_user_prompt(ift_tokenizer, prompt)
 
+    # Which search path found the boundary was an open question after S4 -- the
+    # cut was provably right, but which code produced it was invisible. The
+    # report list answers it without changing find_trace_end's return type.
     path = []
     reasoning_cut = find_trace_end(
         reasoning_generated, reasoning_tokenizer, report=path
     )
 
-    # quiet=True keeps the audit as one line: the decoded text either side of the
-    # cut is the part of the full block that has actually ever caught anything.
-    verify_phase_cut(
-        reasoning_tokenizer, reasoning_generated, reasoning_cut, quiet=True
+    # verify_phase_cut() prints its one-line audit in quiet mode rather than
+    # returning it, and the loud path must keep doing exactly that. Capturing
+    # here puts the line inside the diagnostics block in reading order, instead
+    # of wherever the call happens to sit.
+    _, cut_line = capture_stdout(
+        verify_phase_cut,
+        reasoning_tokenizer,
+        reasoning_generated,
+        reasoning_cut,
+        quiet=True,
     )
 
-    if path:
-        # Which search path found the boundary was an open question after S4 --
-        # the cut was provably right, but which code produced it was invisible.
-        print(f"  trace-end found by: {path[0]}")
+    diag.append(cut_line.strip())
+    diag.append(f"trace-end found by: {path[0] if path else 'not-found'}")
 
     if reasoning_cut is None:
-        print("  SKIPPED: no trace-closing tag, so there is no answering phase")
-        print("  to compare against -- and a fallback to the whole generation")
-        print("  would be labelled 'matched phase' while not being matched.")
+
+        print()
+        print("   RESULT: skipped -- the reasoning response above never closed")
+        print("   </think>, so there is no answering phase to compare against.")
+        print("   Falling back to the whole generation would be labelled")
+        print("   'matched phase' while not being matched. The response above IS")
+        print("   the finding for this prompt.")
+
+        claude_block(diag)
+
         return None
 
     think_tokens = reasoning_cut
     answer_tokens = reasoning_end - reasoning_cut
 
     if think_tokens < 1 or answer_tokens < 1:
+
+        print()
         print(
-            f"  SKIPPED: the cut leaves an empty phase --"
-            f" thinking {think_tokens}, answering {answer_tokens}."
+            f"   RESULT: skipped -- the cut leaves an empty phase"
+            f" (thinking {think_tokens}, answering {answer_tokens})."
         )
+
+        claude_block(diag)
+
         return None
 
     ift_full = _as_numpy(ift_run["attention"])
     reasoning_full = _as_numpy(reasoning_run["attention"])
 
     if ift_end > ift_full.shape[0] or reasoning_end > reasoning_full.shape[0]:
-        print("  SKIPPED: a window is longer than the tensor it slices.")
+
+        print()
+        print("   RESULT: skipped -- a window is longer than the tensor it slices.")
+
+        claude_block(diag + [
+            f"IFT window {ift_end} / tensor {ift_full.shape[0]}",
+            f"Reasoning window {reasoning_end} / tensor {reasoning_full.shape[0]}",
+        ])
+
         return None
 
     ift_shape = prompt_shape(ift_full, start, end, lo=0, hi=ift_end)
@@ -2850,59 +2044,75 @@ def stage_c_for_prompt(index):
     )
 
     # Checked before any distance is quoted: a shape that does not sum to 1 means
-    # the slicing is wrong, and a wrong slice produces plausible-looking numbers.
-    for label, shape in (
-        ("IFT", ift_shape),
-        ("Reasoning-think", think_shape),
-        ("Reasoning-answer", answer_shape),
-    ):
-        total = float(np.abs(shape).sum())
+    # the slicing is wrong, and a wrong slice still produces plausible numbers.
+    bad = [
+        f"{label} {float(np.abs(shape).sum()):.6f}"
+        for label, shape in (
+            ("IFT", ift_shape),
+            ("Reasoning-think", think_shape),
+            ("Reasoning-answer", answer_shape),
+        )
+        if abs(float(np.abs(shape).sum()) - 1.0) >= 1e-6
+    ]
 
-        if abs(total - 1.0) >= 1e-6:
-            print(f"  SKIPPED: {label} shape sums to {total:.6f}, not 1.")
-            return None
+    if bad:
+
+        print()
+        print("   RESULT: skipped -- a shape does not sum to 1, so the slice is")
+        print("   wrong and any distance from it would be wrong too.")
+
+        claude_block(diag + ["shape sums: " + ", ".join(bad)])
+
+        return None
 
     c2 = total_variation_distance(ift_shape, answer_shape)
     c1 = total_variation_distance(think_shape, answer_shape)
 
-    # Computed once and shared by the table and the chart, so the printed
-    # numbers and the bars cannot disagree through a repeated call.
+    # Computed ONCE and passed to both the table and the charts, so the printed
+    # numbers and the bars cannot disagree through a second call.
     c2_diff = per_word_diff(ift_shape, answer_shape)
     c1_diff = per_word_diff(think_shape, answer_shape)
 
-    print(
-        f"  windows: IFT {ift_end} tok (answering) |"
-        f" Reasoning {think_tokens} thinking + {answer_tokens} answering"
+    diag += [
+        f"windows: IFT {ift_end} tok answering |"
+        f" Reasoning {think_tokens} thinking + {answer_tokens} answering",
+        f"shapes sum to 1: IFT {float(ift_shape.sum()):.6f},"
+        f" think {float(think_shape.sum()):.6f},"
+        f" answer {float(answer_shape.sum()):.6f}",
+        f"C1 (same model, thinking vs answering) = {c1:.4f}",
+        f"C2 (IFT vs Reasoning, both answering)  = {c2:.4f}",
+        "NOTE: both models are IN the answering phase, but IFT answers in a few",
+        "tokens and Reasoning answers at length -- same phase, not same verbosity.",
+    ]
+
+    section(
+        f"[{index}] {kind} -- attention per prompt word, normalized (sums to 1)"
     )
-    print(f"  C1 (same model, thinking vs answering) = {c1:.4f}")
-    print(f"  C2 (IFT vs Reasoning, both answering)  = {c2:.4f}")
+    print("   R_answer_minus_IFT      = the gap the top figure draws  (C2)")
+    print("   R_answer_minus_thinking = the gap the bottom figure draws (C1)")
+    display(
+        shape_table(labels, ift_shape, think_shape, answer_shape, c2_diff, c1_diff)
+    )
 
-    display(pd.DataFrame({
-        "token": labels,
-        "IFT_answering": ift_shape,
-        "Reasoning_answering": answer_shape,
-        "C2_answer_minus_IFT": c2_diff,
-    }))
-
-    fig_c2 = plot_shape_diff(
+    show_figure(plot_shape_diff(
         labels,
         c2_diff,
         f"[{index}] {kind} -- C2: Reasoning answering vs IFT answering"
         f"  (TV {c2:.4f})",
         "Reasoning weights it more",
         "IFT weights it more",
-    )
-    show_figure(fig_c2)
+    ))
 
-    fig_c1 = plot_shape_diff(
+    show_figure(plot_shape_diff(
         labels,
         c1_diff,
         f"[{index}] {kind} -- C1: answering vs thinking, same model"
         f"  (TV {c1:.4f})",
         "answering weights it more",
         "thinking weights it more",
-    )
-    show_figure(fig_c1)
+    ))
+
+    claude_block(diag)
 
     return {
         "prompt": index,
@@ -2927,8 +2137,8 @@ for index in NEW_PROMPT_INDICES:
     # prompt whose tokenization does not survive templating, a window that is
     # empty, a shape that is all zeros. Without this, one such prompt aborts the
     # whole sweep and every prompt after it is lost, which is the same shape of
-    # failure as the S1 broad `except Exception` that hid a NameError for a
-    # whole run. ValueError is a type those functions choose; a NameError or a
+    # failure as the S1 broad `except Exception` that hid a NameError for a whole
+    # run. ValueError is a type those functions choose; a NameError or a
     # TypeError from a typo would still come through and be seen.
     try:
 
@@ -2936,9 +2146,9 @@ for index in NEW_PROMPT_INDICES:
 
     except ValueError as exc:
 
-        print(f"\n  SKIPPED prompt {index}: {type(exc).__name__}: {exc}")
-        print("  (a condition of this prompt, not of the run -- later prompts")
-        print("  are unaffected)")
+        print(f"\n   SKIPPED prompt {index}: {type(exc).__name__}: {exc}")
+        print("   (a condition of this prompt, not of the run -- later prompts")
+        print("   are unaffected)")
 
         row = None
 
@@ -2946,33 +2156,34 @@ for index in NEW_PROMPT_INDICES:
         stage_c_rows.append(row)
 
 
-print("\n" + "=" * 64)
-print("C1 / C2 ACROSS PROMPT TYPES")
-print("=" * 64)
-
-if stage_c_rows:
-
-    display(pd.DataFrame(stage_c_rows).set_index("prompt"))
-
-    print("\nC1 = same model, thinking vs answering -- the phase yardstick.")
-    print("C2 = IFT vs Reasoning, both answering -- the model comparison.")
-    print("Read C2 only against its own row's C1: if C2 is not clearly smaller")
-    print("than C1, the model gap is not separable from the phase effect.")
-
-else:
-
-    print("No prompt produced a comparable pair. Every prompt skipped; each")
-    print("SKIPPED line above names its own reason.")
-
 skipped = [
     index for index in NEW_PROMPT_INDICES
     if not any(row["prompt"] == index for row in stage_c_rows)
 ]
 
-if skipped:
-    print(
-        "\nNOTE: prompt(s) " + ", ".join(str(i) for i in skipped)
-        + " produced no number. Reported rather than hidden -- a skip is a"
-        " result about that prompt, not a failure of the run."
-    )
+section("C1 / C2 ACROSS PROMPT TYPES")
 
+if stage_c_rows:
+
+    display(pd.DataFrame(stage_c_rows).set_index("prompt"))
+
+else:
+
+    print("   No prompt produced a comparable pair. Every prompt skipped; the")
+    print("   block above for each prompt names its own reason.")
+
+claude_block([
+    "C1 = same model, thinking vs answering -- the phase yardstick.",
+    "C2 = IFT vs Reasoning, both answering -- the model comparison.",
+    "Read C2 only against its own row's C1: if C2 is not clearly smaller than",
+    "C1, the model gap is not separable from the phase effect.",
+])
+
+section("WHAT WE CAN INFER")
+
+for line in inference_facts(stage_c_rows, len(NEW_PROMPT_INDICES), skipped):
+    print("   " + line)
+
+print("\n   Counts only. The reading of them is written by hand after the run --")
+print("   a template cannot tell 'the model refused to stop' from 'the prompt")
+print("   was cut off'.")

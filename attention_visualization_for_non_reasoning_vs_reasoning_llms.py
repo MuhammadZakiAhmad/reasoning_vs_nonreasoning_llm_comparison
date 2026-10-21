@@ -51,23 +51,38 @@ from models import get_model
 # IFT model writes a full worked solution), so 256 was truncating them
 # mid-sentence.
 #
-# NOT a safety net. The S5 run killed that assumption: 5 of the 7 `kind` prompts
-# ended at exactly this cap with no </think> and no answer -- opinion,
-# counterfactual, creative, math, math-trap. It is a real ceiling that the
-# reasoning model runs into, not a bound it never approaches.
+# RAISED to 2048 on 2026-10-21. 2048 is the value the reasoning model's own
+# generation_config.json ships, so this is the model authors' budget rather
+# than ours. The 1024 cap was cutting the reasoning model in half: at 1024 it
+# reached the cap on 7 of 7 `kind` prompts and emitted no turn terminator on
+# ANY of them -- it closed </think> on only 2 of 7 -- while the IFT model
+# terminated on its own on 7 of 7, well under the cap. The reasoning model's
+# own config carries no min_new_tokens, forced_eos_token_id or
+# repetition_penalty, so nothing in it could have suppressed the terminator;
+# 1024 was simply our ceiling, not the model's.
+#
+# NOT a safety net, at either value. The S5 run killed that assumption: 5 of
+# the 7 `kind` prompts ended at exactly the 1024 cap with no </think> and no
+# answer -- opinion, counterfactual, creative, math, math-trap.
+#
+# Whether the model terminates at all is a bounded claim, never an absolute
+# one: the honest phrasing is "did not terminate within N tokens", and the
+# horizon has to travel with the number.
 #
 # Cost warning: collect_prompt_attention() runs one forward pass per generated
-# token, so runtime is linear in generated length -- 1024 is roughly 4x the
-# work of 256, per model. The cap is part of the cache key, so changing it
-# invalidates every cached prompt and pays that cost again.
-MAX_NEW_TOKENS = 1024
+# token, so runtime is linear in generated length -- 2048 is roughly 8x the
+# work of 256, per model. The cap sits in the CACHE FILENAME, not just the
+# digest, so the 1024 runs stay on disk: they are not reused (the filename
+# differs) but they are not destroyed either, and the two sets can be compared
+# directly.
+MAX_NEW_TOKENS = 2048
 
 # Where a completed (generation + attention) run is cached, for the life of the
 # Colab VM.
 #
 # Why this exists: `%run` re-executes this whole file, and the attention
-# collection costs one forward pass per generated token -- over 2000 passes for
-# the two models at a 1024-token cap. Without a cache, changing a single print
+# collection costs one forward pass per generated token -- over 4000 passes for
+# the two models at the current cap. Without a cache, changing a single print
 # statement costs a full regeneration. With one, only the first run in a kernel
 # pays that, and every later run reads the tensor off disk in well under a
 # second.
@@ -702,9 +717,9 @@ def generate_response(model, tokenizer, prompt):
         print(
             f"NOTE: generation reached the {MAX_NEW_TOKENS}-token cap, so the "
             "reply may be TRUNCATED rather than finished -- and on non-factual "
-            "prompts the reasoning model does run past 1024 while still inside "
-            "its trace. The status line reports whether a loop fired, but a "
-            "model can wander or self-repeat inside <think> without ever "
+            "prompts the reasoning model does run past the cap while still "
+            "inside its trace. The status line reports whether a loop fired, "
+            "but a model can wander or self-repeat inside <think> without ever "
             "becoming periodic, and no detector here would see that. Read the "
             "generation summary printed with each prompt."
         )
@@ -1795,7 +1810,7 @@ def generation_summary(text, tail=700):
     having to know about prefixes.
 
     Why this and not the whole text: on non-factual prompts the reasoning model
-    runs to the 1024 cap with its trace still open, and the two things that need
+    runs to the cap with its trace still open, and the two things that need
     reading are (a) whether the trace opened and closed at all, and (b) what the
     model was doing when generation stopped. Printing several thousand
     characters per prompt would put the report back to being the wall of text

@@ -41,6 +41,28 @@ supply from a single number each:
        sink-dominant heads and zeroing the sink column, it is not a sink
        artifact.
 
+    6. LENGTH-MATCHED ERROR BARS. The unmatched comparison pairs a long
+       thinking window with a short answering window, and the length-matched
+       block showed that this asymmetry moves C1 by 40%. A significance
+       statement computed on the unmatched windows is a statement about
+       unequal averaging, not about models. So the bootstrap is also run on
+       the matched windows, where both sides carry the same number of
+       generated tokens.
+
+    7. SLICE SENSITIVITY. Even at matched length, the phase effect depends on
+       WHICH part of the thinking window is averaged: the first 436 thinking
+       tokens and the last 436 thinking tokens are different places in the
+       reasoning, and they do not sit the same distance from the answer. If
+       the spread across slices is as large as the C1-vs-C2 gap, then the
+       number is a property of the slice and not quotable as "the phase
+       effect".
+
+    8. SHARED READER HEADS. Dropping the sink-dominant heads from each model
+       separately leaves the two sides holding DIFFERENT head populations, so
+       part of the resulting distance is composition, not shape. This block
+       keeps only the heads that are readers in BOTH models, which is the same
+       set on both sides, and puts error bars on it.
+
 HOW TO RUN
 ----------
 In the SAME Colab kernel that just ran the sweep, in this order:
@@ -408,8 +430,116 @@ def per_token_table(attention, lo, hi):
     return attention[lo:hi].mean(axis=(1, 2))
 
 
+def per_head_table(attention, lo, hi):
+    """Mean prompt attention per (layer, head): [layers, heads, prompt_tokens].
+
+    Needed for the reader-head work, where the head set differs from the one
+    the layer and token tables average over. Averages commute, so this is the
+    same number the per-layer table is built from, just with the head axis
+    left in.
+    """
+
+    return attention[lo:hi].mean(axis=0)
+
+
+def fixed_length_slices(window_length, slice_length):
+    """Every place a slice of `slice_length` can sit inside a window.
+
+    Returns [(label, lo, hi)]. A window no longer than the slice has only one
+    possible slice and is reported as "full"; a longer one has three -- the
+    start, the middle and the end -- because the point of this helper is to
+    find out whether the answer depends on which part of a long window gets
+    averaged.
+    """
+
+    if window_length <= slice_length:
+        return [("full", 0, window_length)]
+
+    options = [
+        ("early", 0, slice_length),
+        (
+            "middle",
+            (window_length - slice_length) // 2,
+            (window_length - slice_length) // 2 + slice_length,
+        ),
+        ("late", window_length - slice_length, window_length),
+    ]
+
+    unique = []
+    seen = set()
+
+    for label, lo, hi in options:
+
+        if (lo, hi) in seen:
+            continue
+
+        seen.add((lo, hi))
+        unique.append((label, lo, hi))
+
+    return unique
+
+
+def shape_from_masked_heads(table, mask, start, end):
+    """The prompt shape built from a chosen set of (layer, head) pairs.
+
+    table: [layers, heads, prompt_tokens] -- per_head_table()
+    mask:  [layers, heads] -- True for the heads to keep
+
+    The sink needs no special handling here: it sits at prompt index 0,
+    outside the user-token slice, so slicing [start:end] removes it. That is
+    the same reason prompt_shape() does not zero it either.
+    """
+
+    vector = (table * mask[..., None]).sum(axis=(0, 1))
+
+    return normalize(vector[start:end])
+
+
+def shared_reader_mask(namespace, ift_window, reasoning_window, threshold):
+    """The heads that are READERS IN BOTH models, at one threshold.
+
+    keep_reader_heads() works out "share < threshold" from the sink profile,
+    so a head is a reader on one side and not the other often enough to
+    matter. Keeping each model's own readers leaves the two sides holding
+    different populations, and part of the distance between them is then
+    composition rather than shape. This returns the INTERSECTION, which is
+    the same set of heads on both sides.
+
+    The rule is the extracted function's own rule -- share < threshold -- so
+    the mask here and the mask inside keep_reader_heads() agree by
+    construction, not by two pieces of code happening to match.
+    """
+
+    share_ift, _ = namespace["sink_profile"](ift_window)
+    share_reasoning, _ = namespace["sink_profile"](reasoning_window)
+
+    keep = (share_ift < threshold) & (share_reasoning < threshold)
+
+    return keep, share_ift, share_reasoning
+
+
+def retained_with_mask(namespace, window, mask, threshold):
+    """How much non-sink attention the masked heads hold, per model.
+
+    keep_reader_heads() computes this from the share array it is given, so
+    it is handed a synthetic one: 0.0 on the heads to keep, 1.0 on the heads
+    to drop. Its own rule is `share < threshold`, and 1.0 is not below any
+    threshold used here, so the mask it derives is exactly the mask passed
+    in. The retained fraction is then computed by the extracted code rather
+    than restated here.
+    """
+
+    synthetic_share = np.where(mask, 0.0, 1.0)
+
+    vector, retained, kept, total = namespace["keep_reader_heads"](
+        window, synthetic_share, threshold
+    )
+
+    return retained, kept, total
+
+
 def bootstrap_layers(namespace, tables, start, end, replicates, seed):
-    """Paired bootstrap over LAYERS.
+    """Paired bootstrap over LAYERS, for the full windows AND the matched ones.
 
     Paired means the same resampled layer indices are used for every shape in
     a replicate -- the IFT shape, the thinking shape and the answering shape.
@@ -418,40 +548,64 @@ def bootstrap_layers(namespace, tables, start, end, replicates, seed):
     move?" Resampling each model independently would answer a different
     question, and would inflate the spread of the GAP.
 
-    tables: (ift_per_layer, think_per_layer, answer_per_layer), each over the
-    full prompt range. All three are needed: C1 compares THINKING with
+    tables: a dict of per-layer tables, keyed by role:
+      think_full / answer_full  -- the unmatched comparison
+      think_m1  / answer_m1     -- C1 on length-matched windows
+      ift_full  / ift_m2        -- the IFT side, matched and unmatched
+      answer_m2                 -- the reasoning answering side, matched
+    All three of the original roles are needed: C1 compares THINKING with
     ANSWERING inside one model, so a bootstrap that only had the answering
     table would compare the answering phase with itself and report C1 = 0.
+
+    The layer selection is drawn ONCE per replicate and reused for every
+    table, which is what makes the matched and unmatched numbers comparable
+    with each other AND with the previous run of this script.
     """
 
-    ift_table, think_table, answer_table = tables
+    comparisons = (
+        ("C1", "think_full", "answer_full"),
+        ("C2", "ift_full", "answer_full"),
+        ("C1_matched", "think_m1", "answer_m1"),
+        ("C2_matched", "ift_m2", "answer_m2"),
+    )
 
-    layer_count = ift_table.shape[0]
+    layer_count = tables["ift_full"].shape[0]
 
     rng = np.random.default_rng(seed)
 
-    c1_values = []
-    c2_values = []
+    results = {name: [] for name, _, _ in comparisons}
 
     for _ in range(replicates):
 
         selection = rng.integers(0, layer_count, layer_count)
 
-        ift_shape = normalize(ift_table[selection].mean(axis=0)[start:end])
-        think_shape = normalize(think_table[selection].mean(axis=0)[start:end])
-        answer_shape = normalize(answer_table[selection].mean(axis=0)[start:end])
+        shapes = {}
+        broken = False
 
-        if ift_shape is None or think_shape is None or answer_shape is None:
+        for key, table in tables.items():
+
+            shape = normalize(table[selection].mean(axis=0)[start:end])
+
+            if shape is None:
+                broken = True
+                break
+
+            shapes[key] = shape
+
+        if broken:
             continue
 
-        c1_values.append(
-            float(namespace["total_variation_distance"](think_shape, answer_shape))
-        )
-        c2_values.append(
-            float(namespace["total_variation_distance"](ift_shape, answer_shape))
-        )
+        for name, left_key, right_key in comparisons:
 
-    return np.array(c1_values), np.array(c2_values)
+            results[name].append(
+                float(
+                    namespace["total_variation_distance"](
+                        shapes[left_key], shapes[right_key]
+                    )
+                )
+            )
+
+    return {name: np.array(values) for name, values in results.items()}
 
 
 def bootstrap_tokens(namespace, tables, start, end, replicates, seed):
@@ -459,40 +613,114 @@ def bootstrap_tokens(namespace, tables, start, end, replicates, seed):
 
     The layer bootstrap asks how much the answer depends on WHICH LAYERS
     carried the attention. This one asks how much it depends on WHICH
-    GENERATED TOKENS were averaged in. Both are real sources of noise in a
-    single run, and the larger of the two is the honest floor.
+    GENERATED TOKENS were averaged in.
+
+    The axis is NOT paired the way the layer axis is, and the difference
+    matters: the three windows are different CONTENT, so there is no honest
+    way to say that token 40 of the thinking and token 40 of the answering
+    are "the same draw". Each window is therefore resampled on its own, which
+    makes the spread WIDER than a paired test would, not narrower. The
+    probability printed from this axis is a Monte Carlo over independent
+    resamples; the layer axis is the one that supports a paired claim.
+
+    The draw order follows the table dict, and the first three entries are the
+    original three windows, so the unmatched C1 and C2 numbers are unchanged
+    from the previous run of this script.
     """
 
-    ift_tokens, think_tokens, answer_tokens = tables
+    comparisons = (
+        ("C1", "think_full", "answer_full"),
+        ("C2", "ift_full", "answer_full"),
+        ("C1_matched", "think_m1", "answer_m1"),
+        ("C2_matched", "ift_m2", "answer_m2"),
+    )
 
     rng = np.random.default_rng(seed)
 
-    c1_values = []
-    c2_values = []
+    results = {name: [] for name, _, _ in comparisons}
 
     for _ in range(replicates):
 
-        ift_pick = rng.integers(0, ift_tokens.shape[0], ift_tokens.shape[0])
-        think_pick = rng.integers(0, think_tokens.shape[0], think_tokens.shape[0])
-        answer_pick = rng.integers(
-            0, answer_tokens.shape[0], answer_tokens.shape[0]
-        )
+        shapes = {}
+        broken = False
 
-        ift_shape = normalize(ift_tokens[ift_pick].mean(axis=0)[start:end])
-        think_shape = normalize(think_tokens[think_pick].mean(axis=0)[start:end])
-        answer_shape = normalize(answer_tokens[answer_pick].mean(axis=0)[start:end])
+        for key, table in tables.items():
 
-        if ift_shape is None or think_shape is None or answer_shape is None:
+            picks = rng.integers(0, table.shape[0], table.shape[0])
+
+            shape = normalize(table[picks].mean(axis=0)[start:end])
+
+            if shape is None:
+                broken = True
+                break
+
+            shapes[key] = shape
+
+        if broken:
             continue
 
-        c1_values.append(
-            float(namespace["total_variation_distance"](think_shape, answer_shape))
+        for name, left_key, right_key in comparisons:
+
+            results[name].append(
+                float(
+                    namespace["total_variation_distance"](
+                        shapes[left_key], shapes[right_key]
+                    )
+                )
+            )
+
+    return {name: np.array(values) for name, values in results.items()}
+
+
+def bootstrap_reader_layers(namespace, ift_table, reasoning_table, mask,
+                            start, end, replicates, seed):
+    """Layer bootstrap for the SHARED-reader-heads C2, and the all-heads C2
+    computed on the same layer draws.
+
+    Two numbers come out of the same replicate, so they can be compared
+    directly: the C2 over the shared reader heads, and the C2 over all heads.
+    The head set is fixed at its full-window value rather than recomputed per
+    replicate, so the interval reflects layer sampling only -- the mask
+    itself is treated as known.
+    """
+
+    layer_count = ift_table.shape[0]
+
+    rng = np.random.default_rng(seed)
+
+    reader_values = []
+    full_values = []
+
+    for _ in range(replicates):
+
+        selection = rng.integers(0, layer_count, layer_count)
+
+        ift_selected = ift_table[selection]
+        reasoning_selected = reasoning_table[selection]
+        keep_selected = mask[selection]
+
+        left_reader = shape_from_masked_heads(
+            ift_selected, keep_selected, start, end
         )
-        c2_values.append(
-            float(namespace["total_variation_distance"](ift_shape, answer_shape))
+        right_reader = shape_from_masked_heads(
+            reasoning_selected, keep_selected, start, end
         )
 
-    return np.array(c1_values), np.array(c2_values)
+        left_full = normalize(ift_selected.sum(axis=(0, 1))[start:end])
+        right_full = normalize(reasoning_selected.sum(axis=(0, 1))[start:end])
+
+        if (left_reader is None or right_reader is None
+                or left_full is None or right_full is None):
+            continue
+
+        reader_values.append(
+            float(namespace["total_variation_distance"](left_reader, right_reader))
+        )
+        full_values.append(
+            float(namespace["total_variation_distance"](left_full, right_full))
+        )
+
+    return np.array(reader_values), np.array(full_values)
 
 
 def summarise(values, label):
@@ -603,6 +831,43 @@ def per_head_decomposition(namespace, ift_att, reasoning_att, start, end,
 
 def rule(char="=", width=74):
     print(char * width)
+
+
+def print_slice_grid(title, row_name, rows, columns, values):
+    """A small grid of numbers, with a spread row underneath.
+
+    values: dict[(row_label, column_label)] -> float
+    """
+
+    print(f"      {title}")
+    print(f"      {row_name:<10}" + "".join(f"{col:>13}" for col in columns))
+
+    for row in rows:
+
+        line = f"      {row:<10}"
+
+        for col in columns:
+
+            value = values.get((row, col))
+
+            line += f"{value:>13.4f}" if value is not None else f"{'-':>13}"
+
+        print(line)
+
+    line = f"      {'spread':<10}"
+
+    for col in columns:
+
+        column_values = [
+            values[(row, col)] for row in rows if (row, col) in values
+        ]
+
+        if column_values:
+            line += f"{max(column_values) - min(column_values):>13.4f}"
+        else:
+            line += f"{'-':>13}"
+
+    print(line)
 
 
 def report_prompt(namespace, index, cap, tokenizers, cache_dir):
@@ -722,6 +987,14 @@ def report_prompt(namespace, index, cap, tokenizers, cache_dir):
         f"Reasoning thinking {think_tokens} + answering {answer_tokens}"
     )
 
+    # The two matching lengths. C1 compares thinking with answering, so it
+    # matches on the shorter of those two; C2 compares the two answering
+    # windows, so it matches on the shorter of those. They are usually
+    # DIFFERENT numbers, which is why the two comparisons need separate
+    # tables rather than one shared "matched" table.
+    matched_c1 = min(think_tokens, answer_tokens)
+    matched = min(ift_end, answer_tokens)
+
     # --- the run cross-check -------------------------------------------------
     # Only at 2048: the 1024 numbers are a DIFFERENT measurement (truncated
     # answering windows), so comparing them against the 2048 baselines would
@@ -784,13 +1057,26 @@ def report_prompt(namespace, index, cap, tokenizers, cache_dir):
     )
 
     # --- 2. error bars --------------------------------------------------------
-    layer_tables = (
-        per_layer_table(ift_att, 0, ift_end),
-        per_layer_table(reasoning_att, 0, reasoning_cut),
-        per_layer_table(reasoning_att, reasoning_cut, reasoning_end),
-    )
+    # The dict order is deliberate: the first three entries are the three
+    # original windows, so the unmatched C1 and C2 come out of the bootstrap
+    # stream exactly as they did before the matched tables were added.
+    layer_tables = {
+        "ift_full": per_layer_table(ift_att, 0, ift_end),
+        "think_full": per_layer_table(reasoning_att, 0, reasoning_cut),
+        "answer_full": per_layer_table(
+            reasoning_att, reasoning_cut, reasoning_end
+        ),
+        "ift_m2": per_layer_table(ift_att, 0, matched),
+        "think_m1": per_layer_table(reasoning_att, 0, matched_c1),
+        "answer_m1": per_layer_table(
+            reasoning_att, reasoning_cut, reasoning_cut + matched_c1
+        ),
+        "answer_m2": per_layer_table(
+            reasoning_att, reasoning_cut, reasoning_cut + matched
+        ),
+    }
 
-    c1_layers, c2_layers = bootstrap_layers(
+    layer_boot = bootstrap_layers(
         namespace,
         layer_tables,
         start,
@@ -799,13 +1085,23 @@ def report_prompt(namespace, index, cap, tokenizers, cache_dir):
         BOOTSTRAP_SEED,
     )
 
-    token_tables = (
-        per_token_table(ift_att, 0, ift_end),
-        per_token_table(reasoning_att, 0, reasoning_cut),
-        per_token_table(reasoning_att, reasoning_cut, reasoning_end),
-    )
+    token_tables = {
+        "ift_full": per_token_table(ift_att, 0, ift_end),
+        "think_full": per_token_table(reasoning_att, 0, reasoning_cut),
+        "answer_full": per_token_table(
+            reasoning_att, reasoning_cut, reasoning_end
+        ),
+        "ift_m2": per_token_table(ift_att, 0, matched),
+        "think_m1": per_token_table(reasoning_att, 0, matched_c1),
+        "answer_m1": per_token_table(
+            reasoning_att, reasoning_cut, reasoning_cut + matched_c1
+        ),
+        "answer_m2": per_token_table(
+            reasoning_att, reasoning_cut, reasoning_cut + matched
+        ),
+    }
 
-    c1_tokens, c2_tokens = bootstrap_tokens(
+    token_boot = bootstrap_tokens(
         namespace,
         token_tables,
         start,
@@ -813,6 +1109,11 @@ def report_prompt(namespace, index, cap, tokenizers, cache_dir):
         BOOTSTRAP_REPLICATES,
         BOOTSTRAP_SEED,
     )
+
+    c1_layers = layer_boot["C1"]
+    c2_layers = layer_boot["C2"]
+    c1_tokens = token_boot["C1"]
+    c2_tokens = token_boot["C2"]
 
     print()
     print(f"   --- BOOTSTRAP over LAYERS ({BOOTSTRAP_REPLICATES} replicates) ---")
@@ -834,10 +1135,12 @@ def report_prompt(namespace, index, cap, tokenizers, cache_dir):
     if len(c1_tokens) and len(c2_tokens):
         p_phase_larger = float((c1_tokens > c2_tokens).mean())
         print(f"      P(C1 > C2) in a replicate: {p_phase_larger:.3f}")
+        print(
+            "      note: this axis is NOT paired -- the three windows are "
+            "different content, so each is resampled on its own"
+        )
 
     # --- 3. length-matched recompute -----------------------------------------
-    matched = min(ift_end, answer_tokens)
-
     ift_matched = namespace["prompt_shape"](
         ift_att, start, end, lo=0, hi=matched
     )
@@ -848,8 +1151,6 @@ def report_prompt(namespace, index, cap, tokenizers, cache_dir):
     c2_matched = float(
         namespace["total_variation_distance"](ift_matched, answer_matched)
     )
-
-    matched_c1 = min(think_tokens, answer_tokens)
 
     think_matched = namespace["prompt_shape"](
         reasoning_att, start, end, lo=0, hi=matched_c1
@@ -874,6 +1175,241 @@ def report_prompt(namespace, index, cap, tokenizers, cache_dir):
         f"{c1_matched:.4f}   (unmatched {c1:.4f}, "
         f"change {c1_matched - c1:+.4f})"
     )
+
+    # --- 3a. error bars on the matched windows --------------------------------
+    # The unmatched comparison pairs a long thinking window with a short
+    # answering window, and the block above shows that this asymmetry moves C1
+    # by tens of percent. A significance statement computed on the unmatched
+    # windows is therefore a statement about unequal averaging, not about
+    # models. This is the same bootstrap, run on windows that carry the same
+    # number of generated tokens on both sides.
+    print()
+    print(
+        f"   --- BOOTSTRAP ON THE LENGTH-MATCHED WINDOWS "
+        f"({BOOTSTRAP_REPLICATES} replicates) ---"
+    )
+    print("      both sides now carry the same number of generated tokens")
+
+    matched_boot = {}
+
+    for axis, values in (("layers", layer_boot), ("tokens", token_boot)):
+
+        c1m = values["C1_matched"]
+        c2m = values["C2_matched"]
+
+        matched_boot[axis] = (c1m, c2m)
+
+        print(f"      {axis}:")
+        print(summarise(c1m, "   C1 matched"))
+        print(summarise(c2m, "   C2 matched"))
+
+        if len(c1m) and len(c2m):
+
+            p_matched = float((c1m > c2m).mean())
+
+            print(f"      P(C1m > C2m): {p_matched:.3f}")
+
+    # --- 3b. slice sensitivity ------------------------------------------------
+    # Even at matched length, WHICH part of the thinking window is averaged
+    # moves the number. The first 436 thinking tokens and the last 436
+    # thinking tokens are different places in the reasoning. If the spread
+    # across slices is as large as the gap between C1 and C2, then the number
+    # is a property of the slice, not a quotable "phase effect".
+    print()
+    print("   --- SLICE SENSITIVITY: does the number depend on WHICH part of")
+    print("       the window gets averaged? ---")
+
+    think_slices = fixed_length_slices(think_tokens, matched_c1)
+    answer_slices = fixed_length_slices(answer_tokens, matched_c1)
+
+    c1_slice_values = {}
+
+    for think_label, think_lo, think_hi in think_slices:
+
+        for answer_label, answer_lo, answer_hi in answer_slices:
+
+            think_slice_shape = namespace["prompt_shape"](
+                reasoning_att, start, end, lo=think_lo, hi=think_hi
+            )
+            answer_slice_shape = namespace["prompt_shape"](
+                reasoning_att, start, end,
+                lo=reasoning_cut + answer_lo,
+                hi=reasoning_cut + answer_hi,
+            )
+
+            c1_slice_values[(think_label, answer_label)] = float(
+                namespace["total_variation_distance"](
+                    think_slice_shape, answer_slice_shape
+                )
+            )
+
+    print_slice_grid(
+        "C1 by slice of the THINKING window (columns: slice of the answering window)",
+        "thinking",
+        [label for label, _, _ in think_slices],
+        [label for label, _, _ in answer_slices],
+        c1_slice_values,
+    )
+
+    ift_slices = fixed_length_slices(ift_end, matched)
+    reasoning_answer_slices = fixed_length_slices(answer_tokens, matched)
+
+    c2_slice_values = {}
+
+    for ift_label, ift_lo, ift_hi in ift_slices:
+
+        for answer_label, answer_lo, answer_hi in reasoning_answer_slices:
+
+            ift_slice_shape = namespace["prompt_shape"](
+                ift_att, start, end, lo=ift_lo, hi=ift_hi
+            )
+            reasoning_slice_shape = namespace["prompt_shape"](
+                reasoning_att, start, end,
+                lo=reasoning_cut + answer_lo,
+                hi=reasoning_cut + answer_hi,
+            )
+
+            c2_slice_values[(ift_label, answer_label)] = float(
+                namespace["total_variation_distance"](
+                    ift_slice_shape, reasoning_slice_shape
+                )
+            )
+
+    print_slice_grid(
+        "C2 by slice (rows: slice of the IFT answer, columns: slice of the reasoning answer)",
+        "IFT",
+        [label for label, _, _ in ift_slices],
+        [label for label, _, _ in reasoning_answer_slices],
+        c2_slice_values,
+    )
+
+    c1_spread = (
+        max(c1_slice_values.values()) - min(c1_slice_values.values())
+        if c1_slice_values else 0.0
+    )
+    c2_spread = (
+        max(c2_slice_values.values()) - min(c2_slice_values.values())
+        if c2_slice_values else 0.0
+    )
+    matched_gap = c1_matched - c2_matched
+
+    print()
+    print(
+        f"      the C1-vs-C2 gap at matched length is {matched_gap:+.4f}; "
+        f"moving the slice moves C1 by {c1_spread:.4f} and C2 by {c2_spread:.4f}"
+    )
+
+    if max(c1_spread, c2_spread) > abs(matched_gap):
+        print(
+            "      !! the slice choice moves the number MORE than the gap does, "
+            "so the gap does not survive re-cutting the window: it is a "
+            "property of where the cut fell, not of the phase or the model"
+        )
+    else:
+        print(
+            "      the slice choice moves the numbers less than the gap does, "
+            "so the gap survives being re-cut"
+        )
+
+    # --- 3c. shared reader heads ----------------------------------------------
+    # Dropping the sink-dominant heads from each model SEPARATELY leaves the
+    # two sides holding different head populations, so part of the distance
+    # between them is composition rather than shape. This block keeps only
+    # the heads that are readers in BOTH models: the same set on both sides.
+    print()
+    print("   --- C2 OVER SHARED READER HEADS (a reader in BOTH models) ---")
+    print("       the same head set on both sides, so this compares two SHAPES")
+    print("       and not two head populations")
+
+    ift_window = ift_att[0:matched]
+    reasoning_window = reasoning_att[reasoning_cut:reasoning_cut + matched]
+
+    ift_head_table = per_head_table(ift_att, 0, matched)
+    reasoning_head_table = per_head_table(
+        reasoning_att, reasoning_cut, reasoning_cut + matched
+    )
+
+    shared_sweep = {}
+    shared_masks = {}
+
+    for threshold in (0.3, 0.5, 0.7, 0.9):
+
+        keep, _, _ = shared_reader_mask(
+            namespace, ift_window, reasoning_window, threshold
+        )
+
+        if not keep.any():
+
+            print(
+                f"      threshold {threshold:.1f}: no head is a reader in both "
+                "models, so there is nothing to compare"
+            )
+            shared_sweep[threshold] = None
+            continue
+
+        left = shape_from_masked_heads(ift_head_table, keep, start, end)
+        right = shape_from_masked_heads(reasoning_head_table, keep, start, end)
+
+        if left is None or right is None:
+
+            print(f"      threshold {threshold:.1f}: no shape survives")
+            shared_sweep[threshold] = None
+            continue
+
+        distance = float(namespace["total_variation_distance"](left, right))
+
+        retained_ift, kept, total = retained_with_mask(
+            namespace, ift_window, keep, threshold
+        )
+        retained_reasoning, _, _ = retained_with_mask(
+            namespace, reasoning_window, keep, threshold
+        )
+
+        shared_sweep[threshold] = distance
+        shared_masks[threshold] = keep
+
+        print(
+            f"      threshold {threshold:.1f}: C2m {c2_matched:.4f} -> "
+            f"{distance:.4f} ({distance - c2_matched:+.4f})   "
+            f"shared heads {kept}/{total}   holding IFT {retained_ift:.1%} / "
+            f"Reasoning {retained_reasoning:.1%} of the non-sink attention"
+        )
+
+    # Error bars on the shared-reader C2, from the same layer draws as the
+    # all-heads C2, so the two can be compared inside each replicate.
+    if 0.5 in shared_masks:
+
+        reader_boot, full_boot = bootstrap_reader_layers(
+            namespace,
+            ift_head_table,
+            reasoning_head_table,
+            shared_masks[0.5],
+            start,
+            end,
+            BOOTSTRAP_REPLICATES,
+            BOOTSTRAP_SEED,
+        )
+
+        print()
+        print(
+            f"   --- BOOTSTRAP over LAYERS on the SHARED reader heads "
+            f"(threshold 0.5, {BOOTSTRAP_REPLICATES} reps) ---"
+        )
+        print(summarise(reader_boot, "C2 shared-reader"))
+        print(summarise(full_boot, "C2 all-heads (matched)"))
+
+        if len(reader_boot) and len(full_boot):
+
+            p_reader = float((reader_boot > full_boot).mean())
+
+            print(
+                f"      P(shared-reader C2 > all-heads C2): {p_reader:.3f}   "
+                f"(the gap is {'bigger' if p_reader > 0.5 else 'not bigger'} "
+                "on the reader heads)"
+            )
+    else:
+        reader_boot = np.array([])
+        full_boot = np.array([])
 
     # --- 4. the sink, phase-matched -------------------------------------------
     sink_ift = sink_report(
@@ -950,9 +1486,13 @@ def report_prompt(namespace, index, cap, tokenizers, cache_dir):
     # If the conclusion only holds at one threshold, that is what this block
     # is for.
     print()
-    print("   --- C2 OVER READER HEADS ONLY (sink column zeroed, sink-dominant")
-    print("       heads dropped) -- swept over the threshold, because the")
-    print("       conclusion must not depend on where the cutoff is put:")
+    print("   --- C2 OVER EACH MODEL'S OWN READER HEADS (sink column zeroed,")
+    print("       sink-dominant heads dropped) -- swept over the threshold,")
+    print("       because the conclusion must not depend on where the cutoff")
+    print("       is put. CAVEAT: each model keeps its OWN reader heads, so the")
+    print("       two sides hold DIFFERENT populations and part of this")
+    print("       distance is composition rather than shape. The shared-head")
+    print("       block above is the comparable one.")
 
     c2_reader = None
     reader_sweep = {}
@@ -1009,6 +1549,21 @@ def report_prompt(namespace, index, cap, tokenizers, cache_dir):
             if len(c1_layers) and len(c2_layers)
             else None
         ),
+        "p_phase_larger_matched": (
+            float((layer_boot["C1_matched"] > layer_boot["C2_matched"]).mean())
+            if len(layer_boot["C1_matched"]) and len(layer_boot["C2_matched"])
+            else None
+        ),
+        "p_phase_larger_matched_tokens": (
+            float((token_boot["C1_matched"] > token_boot["C2_matched"]).mean())
+            if len(token_boot["C1_matched"]) and len(token_boot["C2_matched"])
+            else None
+        ),
+        "matched_gap": matched_gap,
+        "c1_slice_spread": c1_spread,
+        "c2_slice_spread": c2_spread,
+        "shared_reader_sweep": shared_sweep,
+        "c2_shared_reader": shared_sweep.get(0.5),
         "c2_reader": c2_reader,
         "reader_sweep": reader_sweep,
         "ift_tok": ift_end,
@@ -1123,6 +1678,82 @@ def main():
                 f"C2 {row['C2']:.4f}   " + "  ".join(parts)
             )
 
+        print()
+        print("   LENGTH-MATCHED, WITH ERROR BARS (the number the claim rests on)")
+        header = (
+            f"   {'prompt':<7}{'kind':<14}{'C1m':>8}{'C2m':>8}{'gap':>9}"
+            f"{'P(C1m>C2m)':>12}{'layers P':>10}{'tokens P':>10}"
+        )
+        print(header)
+        print("   " + "-" * (len(header) - 3))
+
+        for row in matched_rows:
+
+            p_layers = row.get("p_phase_larger_matched")
+            p_tokens = row.get("p_phase_larger_matched_tokens")
+
+            print(
+                f"   {row['prompt']:<7}{row['kind']:<14}"
+                f"{row['c1_matched']:>8.4f}{row['c2_matched']:>8.4f}"
+                f"{row['matched_gap']:>+9.4f}"
+                f"{(p_layers if p_layers is not None else float('nan')):>12.3f}"
+                f"{(p_tokens if p_tokens is not None else float('nan')):>10.3f}"
+            )
+
+        print()
+        print("   SLICE SENSITIVITY (how far the number moves when the window")
+        print("   is re-cut) -- compare the spread with the gap above")
+        header = (
+            f"   {'prompt':<7}{'kind':<14}{'C1 spread':>12}{'C2 spread':>12}"
+            f"{'C1m-C2m gap':>13}{'slice moves more?':>20}"
+        )
+        print(header)
+        print("   " + "-" * (len(header) - 3))
+
+        for row in matched_rows:
+
+            c1_spread = row.get("c1_slice_spread", 0.0)
+            c2_spread = row.get("c2_slice_spread", 0.0)
+            gap = abs(row.get("matched_gap", 0.0))
+
+            verdict = (
+                "YES -- gap does not survive" if max(c1_spread, c2_spread) > gap
+                else "no -- gap survives"
+            )
+
+            print(
+                f"   {row['prompt']:<7}{row['kind']:<14}"
+                f"{c1_spread:>12.4f}{c2_spread:>12.4f}{gap:>13.4f}{verdict:>20}"
+            )
+
+        print()
+        print("   C2 OVER SHARED READER HEADS (the same head set on both sides)")
+        header = (
+            f"   {'prompt':<7}{'kind':<14}{'C2m':>8}{'0.3':>9}{'0.5':>9}"
+            f"{'0.7':>9}{'0.9':>9}"
+        )
+        print(header)
+        print("   " + "-" * (len(header) - 3))
+
+        for row in matched_rows:
+
+            sweep = row.get("shared_reader_sweep", {})
+
+            parts = []
+
+            for threshold in (0.3, 0.5, 0.7, 0.9):
+
+                value = sweep.get(threshold)
+
+                parts.append(
+                    f"{value:.4f}" if value is not None else "none"
+                )
+
+            print(
+                f"   {row['prompt']:<7}{row['kind']:<14}"
+                f"{row['c2_matched']:>8.4f}" + "".join(f"{p:>9}" for p in parts)
+            )
+
     # --- the cap question, in one place ---------------------------------------
     by_prompt = {}
 
@@ -1197,6 +1828,15 @@ def main():
     print("     - the bootstrap measures layer and token sampling noise; it")
     print("       does not measure prompt sampling noise, which is the one")
     print("       that a reader will ask about")
+    print("     - the token axis is NOT paired: the three windows are different")
+    print("       content, so each is resampled on its own. Only the layer")
+    print("       axis supports a paired claim")
+    print("     - the split-half floor is a PROXY for the noise, not a")
+    print("       calibrated null. Its halves are shorter than the windows")
+    print("       C1 and C2 are measured on (so it is conservative) AND they")
+    print("       come from one trajectory (so it understates the difference")
+    print("       between two INDEPENDENT runs). Only two independent runs")
+    print("       can calibrate it, and that needs the GPU")
     print("     - the sink SHARE is a ratio, and the raw attention mass is")
     print("       still not quotable")
     print("     - a cap is a horizon, not a proof: 'did not terminate within")
